@@ -1,4 +1,4 @@
-package com.wenqi.rocketmq.quickstart;
+package com.wenqi.rocketmq.quickstart.producer;
 
 import org.apache.rocketmq.client.exception.MQClientException;
 import org.apache.rocketmq.client.producer.DefaultMQProducer;

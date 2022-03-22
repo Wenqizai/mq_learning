@@ -1,4 +1,4 @@
-package com.wenqi.rocketmq.quickstart;
+package com.wenqi.rocketmq.quickstart.producer;
 
 import org.apache.rocketmq.client.producer.DefaultMQProducer;
 import org.apache.rocketmq.client.producer.SendResult;

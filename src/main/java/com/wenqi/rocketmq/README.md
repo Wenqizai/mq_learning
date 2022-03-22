@@ -32,5 +32,17 @@
 2. 异步消息：通常应用在发送端不能容忍长时间地等待Broker响应，对响应时间敏感的业务。
 3. 单向消息：主要用在不特别关心发送结果的场景，例如日志发送。
 
+### Consumer
 
+- 监听器：`MessageListenerConcurrently`, `MessageListenerOrderly` 继承 `MessageListener`；
+- `MessageListenerConcurrently`：并发消费，`MessageListenerOrderly`：顺序消费
+
+### 顺序消息
+
+消息有序指的是可以按照消息的发送顺序来消费(FIFO)。`RocketMQ`可以严格的保证消息有序，可以分为**分区有序**或者**全局有序**。
+
+- 分区有序：消息发送到多Queue
+- 全局有序：消息发送到单Queue
+
+顺序消费的原理解析，在默认的情况下消息发送会采取Round Robin轮询方式把消息发送到不同的queue(分区队列)；而消费消息的时候从多个queue上拉取消息，这种情况发送和消费是不能保证顺序。但是如果控制发送的顺序消息只依次发送到同一个queue中，消费的时候只从这个queue上依次拉取，则就保证了顺序。当发送和消费参与的queue只有一个，则是全局有序；如果多个queue参与，则为分区有序，即相对每个queue，消息都是有序的。
 
