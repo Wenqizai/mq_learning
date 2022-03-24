@@ -1,4 +1,4 @@
-package com.wenqi.rocketmq.aliyun.consumer;
+package com.wenqi.rocketmq.aliyun.normalmsg.consumer;
 
 import com.aliyun.openservices.ons.api.Message;
 import com.aliyun.openservices.ons.api.ONSFactory;
