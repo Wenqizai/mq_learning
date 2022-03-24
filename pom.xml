@@ -34,6 +34,13 @@
             <artifactId>lombok</artifactId>
             <version>1.18.10</version>
         </dependency>
+
+        <dependency>
+            <groupId>com.aliyun.openservices</groupId>
+            <artifactId>ons-client</artifactId>
+            <!--以下版本号请替换为Java SDK的最新版本号-->
+            <version>1.8.8.1.Final</version>
+        </dependency>
     </dependencies>
 
 </project>
