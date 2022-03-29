@@ -175,6 +175,8 @@ private String messageDelayLevel = "1s 5s 10s 30s 1m 2m 3m 4m 5m 6m 7m 8m 9m 10m
 
 原生的Apache RocketMQ并不支持任意事件的延时消息和定时消息，Aliyun RocketMQ可支持定时消息。
 
+(如果要支持任意精度的定时消息消费，就必须在消息服务端对消息进行排序，这势必带来很大的性能损耗。那aliyun是怎么做的？)
+
 > 概念
 
 - 定时消息：Producer发送消息后，某一个**时间点**投递到Consumer进行消费，该消息即定时消息。
@@ -402,6 +404,185 @@ public ConsumeConcurrentlyStatus consumeMessage(List<MessageExt> msgs, ConsumeCo
 同一个消费者Group ID下所有Consumer实例所订阅的Topic、Tag必须完全一致。如果订阅关系不一致，消息消费的逻辑就会混乱，甚至导致消息丢失。
 
 参看：https://help.aliyun.com/document_detail/43523.htm?spm=a2c4g.11186623.0.0.5c4a180a4yjrSG
+
+## 源码
+
+### 问题点（待解决）
+
+1. 消息发送时的负载均衡，多个broker，每个broker都要建Topic？
+
+### NameServer
+
+> 关注点
+
+1. 服务发现与注册机制
+2. 路由管理
+3. 路由存储数据类型和结构
+4. 单点故障与高可用
+
+#### 注册与发现
+
+1. Broker启动时注册，与NameServer保持长连接（长连接断了怎么处理 -> 立即删除）。NameServer每10s检测Broker是否存活；
+2. 若Broker宕机，NameServer会将其在路由表中移除（并不会主动通知客户端）；
+3. 消息生产者在发送消息之前先从NameServer获取Broker服务器的地址列表。
+
+实现细节：
+
+- Broker每隔30s向NameServer集群的每一台机器发送心跳包，包含自身创建的topic路由等信息。
+- 消息客户端每隔30s向NameServer更新对应topic的路由信息。
+- NameServer收到Broker发送的心跳包时会记录时间戳。
+- NameServer每隔10s会扫描一次brokerLiveTable（存放心跳包的时间戳信息），如果在120s内没有收到心跳包，则认为Broker失效，更新topic的路由信息，将失效的Broker信息移除。
+
+#### 高可用
+
+NameServer之间互不通信，高可用是通过部署多台NameServer来实现。因此某一刻，NameServer之间的路由信息不会完全一致。但是对消息发送不会造成重大影响，只是短暂造成消息发送不均衡。
+
+#### 源码
+
+> 初始化
+
+org.apache.rocketmq.namesrv.NamesrvController#initialize
+
+```java
+public boolean initialize() {
+		// 加载kv
+        this.kvConfigManager.load();
+		// 初始化通信模块Netty
+        this.remotingServer = new NettyRemotingServer(this.nettyServerConfig, this.brokerHousekeepingService);
+
+        this.remotingExecutor =
+            Executors.newFixedThreadPool(nettyServerConfig.getServerWorkerThreads(), new ThreadFactoryImpl("RemotingExecutorThread_"));
+
+        this.registerProcessor();
+
+    	// 每10s扫描一次Broker，移除no active broker
+        this.scheduledExecutorService.scheduleAtFixedRate(new Runnable() {
+            @Override
+            public void run() {
+                NamesrvController.this.routeInfoManager.scanNotActiveBroker();
+            }
+        }, 5, 10, TimeUnit.SECONDS);
+
+    	// 每10min打印一次kv配置
+        this.scheduledExecutorService.scheduleAtFixedRate(new Runnable() {
+            @Override
+            public void run() {
+                NamesrvController.this.kvConfigManager.printAllPeriodically();
+            }
+        }, 1, 10, TimeUnit.MINUTES);
+
+        if (TlsSystemConfig.tlsMode != TlsMode.DISABLED) {
+         	// ....
+        }
+
+        return true;
+    }
+```
+
+> 路由信息
+
+org.apache.rocketmq.namesrv.routeinfo.RouteInfoManager
+
+```java
+private final static long BROKER_CHANNEL_EXPIRED_TIME = 1000 * 60 * 2;
+private final ReadWriteLock lock = new ReentrantReadWriteLock();
+private final HashMap<String/* topic */, List<QueueData>> topicQueueTable;
+private final HashMap<String/* brokerName */, BrokerData> brokerAddrTable;
+private final HashMap<String/* clusterName */, Set<String/* brokerName */>> clusterAddrTable;
+private final HashMap<String/* brokerAddr */, BrokerLiveInfo> brokerLiveTable;
+private final HashMap<String/* brokerAddr */, List<String>/* Filter Server */> filterServerTable;
+```
+
+topicQueueTable：Topic下Queue的信息，消息发送时根据它进行负载均衡。
+
+brokerAddrTable：Broker的基础信息，包括所属集群名称、主备Broker地址。
+
+clusterAddrTable：Broker集群信息，存储集群中所有broker名称。
+
+brokerLiveTable：broker状态信息，NameServer每次收到心跳包都会替换该信息。
+
+filterServerTable：Broker上的FilterServer列表，用于类模式消息过滤。类模式过滤机制在4.4及以后版本被废弃。
+
+> 路由注册
+
+- broker启动向NameServer发送心跳包（循环所有的NameServer）：
+
+org.apache.rocketmq.broker.BrokerController#start
+
+org.apache.rocketmq.broker.out.BrokerOuterAPI#registerBrokerAll
+
+```java
+this.scheduledExecutorService.scheduleAtFixedRate(new Runnable() {
+    @Override
+    public void run() {
+        try {
+            BrokerController.this.registerBrokerAll(true, false, brokerConfig.isForceRegister());
+        } catch (Throwable e) {
+            log.error("registerBrokerAll Exception", e);
+        }
+    }
+}, 1000 * 10, Math.max(10000, Math.min(brokerConfig.getRegisterNameServerPeriod(), 60000)), TimeUnit.MILLISECONDS);
+```
+
+- NameServer处理心跳包
+
+1. 收到Netty请求：
+
+​	org.apache.rocketmq.namesrv.processor.DefaultRequestProcessor#processRequest
+
+​	标识：request.getCode() = `RequestCode.REGISTER_BROKER`
+
+2. 更新broker信息
+
+​	org.apache.rocketmq.namesrv.routeinfo.RouteInfoManager#registerBroker
+
+> 路由删除
+
+1. 定时删除（定时线程池10s）
+
+遍历 -> 时间戳比较 -> 先移除路由表信息 -> 再移除路由相关信息 -> 断开连接
+
+org.apache.rocketmq.namesrv.routeinfo.RouteInfoManager#scanNotActiveBroker
+
+org.apache.rocketmq.namesrv.routeinfo.RouteInfoManager#onChannelDestroy
+
+2. 正常关闭Broker
+
+删除该broker的路由信息
+
+org.apache.rocketmq.namesrv.routeinfo.RouteInfoManager#unregisterBroker
+
+3. 关闭Netty连接
+
+org.apache.rocketmq.namesrv.routeinfo.RouteInfoManager#onChannelDestroy
+
+- 关于路由注册删除之间的线程问题
+
+```markdown
+> 引用：https://lists.apache.org/thread/hqclk5v2zmdq5vo6tfxtdtgw439xt8ns
+这里是存在线程安全的问题。 scanNotActiveBroker 只与 unregisterBroker和 registerBroker的之间是线程不安全的。 
+scanNotActiveBroker每10秒执行一次，而unregisterBroker 与 registerBroker 可能很久才会触发。甚至不会触发。 出现线程安全
+的几率很低， scanNotActiveBroker 锁持有时间很长，频率高 scanNotActiveBroker 报错，可以等下下次执行, 每10秒执行一次，
+那么会哟加锁，解锁的操作，比较耗时，在上面的原有下，不加锁是一种好的方式。
+```
+
+> 路由发现
+
+路由信息的变更，NameServer不会推送到客户端，而是客户端定时拉取最新的路由信息。
+
+标识：request.getCode() = `RequestCode.GET_ROUTEINFO_BY_TOPIC`
+
+org.apache.rocketmq.namesrv.processor.DefaultRequestProcessor#getRouteInfoByTopic
+
+
+
+
+
+
+
+
+
+
 
 
 
