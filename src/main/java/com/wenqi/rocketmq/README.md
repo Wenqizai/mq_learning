@@ -574,23 +574,70 @@ scanNotActiveBroker每10秒执行一次，而unregisterBroker 与 registerBroker
 
 org.apache.rocketmq.namesrv.processor.DefaultRequestProcessor#getRouteInfoByTopic
 
+### Producer
 
+图解RocketMQ消息发送和存储流程：https://cloud.tencent.com/developer/article/1717385
 
+> 关注点
 
+1. 消息队列的负载均衡；
+2. 消息发送的高可用；
+3. 批量消息发送的一致性。
 
+#### Topic
 
+1. 生产者每30s向NameServer同步一次路由信息；
+2. NameServer中不存在Topic时，自动创建Topic
 
+==注：Broker的路由信息是持久化的，NameServer的路由信息是在内存中。==
 
+![](../../../../resources/pic/find-topic.png)
 
+#### Send
 
+> 发送高可用
 
+1. 重试机制：默认2次；
+2. 故障规避：消息发送失败后接下来的5min会将消息发送到另外的Broker。
 
+> 消息发送流程
 
+- commitlog
 
+  存储消息的地方，单个文件默认1GB，文件名长度为20位，左边补零，剩余为起始偏移量。
 
+- ReputMessageService ThreadLoop
 
+  每休眠1ms，处理一次doReput方法。循环转发commitlog中内容到consumequeue和index文件中。`org.apache.rocketmq.store.DefaultMessageStore.ReputMessageService#doReput`
 
+- comsumequeue
 
+  consumequeue作为消费消息的索引，保存指定topic下队列消息在commitlog中的其实偏移量（offset），消息大小（size）和消息Tag的哈希码。Tag过滤会用到。
+
+<img src="../../../../resources/pic/consumequeue-struct.png" style="zoom:50%;" />
+
+-  MQClientInstance
+
+消息客户端实例，与RocketMQ服务器（Broker，NameServer）交互，从RebalanceImpl实例的本地缓存变量topicSubscribeInfoTable中，获取该Topic主题下的消息消费队列集合（mqSet）。
+
+- 消费组
+
+根据topic和ConsumerGroup参数获取该消费组下消费者id列表
+
+1. 广播模式所有消费端都会收到消息
+2. 集群模式消费端根据负载均衡策略获取消息（负载均衡策略：默认为平均分配算法，计算出当前Consumer端应该分配到的消息队列）
+
+- PullMessageService ThreadLoop
+  1. 获取PullRequest的处理队列ProcessQueue，然后更新该消息队列最后一次拉取的时间；
+  2. 如果消费者服务状态不为`ServiceState.RUNNING`，或者当前处于暂停状态，默认延迟3s再执行`org.apache.rocketmq.client.impl.consumer.PullMessageService#executePullRequestLater`
+  3. 流量控制，两个维度，消息数量达到阈值（默认1000个），或者消息体大小（默认100MB）
+
+- ConsumeMessageService.submitConsumeRequest()
+
+将拉取的消息放入ProcessQueue的msgTreeMap容器中（`org.apache.rocketmq.client.impl.consumer.ConsumeMessageService#submitConsumeRequest`
+
+- ComsumeRequest ConsumeMessageThread Pool
+  1. 消费线程执行
 
 
 
