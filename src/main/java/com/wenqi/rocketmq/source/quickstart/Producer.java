@@ -14,11 +14,14 @@ public class Producer {
         // 实例化消息生产者Product
         DefaultMQProducer producer = new DefaultMQProducer("source-producer-quick-start");
         // 设置NameServer的地址
-        producer.setNamesrvAddr("127.0.0.1:9876;127.0.0.1:19876");
+        producer.setNamesrvAddr("127.0.0.1:9876;10.0.88.229:9876");
+        producer.setSendMsgTimeout(Integer.MAX_VALUE);
+        producer.setRetryTimesWhenSendFailed(0);
+        producer.setSendLatencyFaultEnable(true);
         // 启动Producer实例
         producer.start();
 
-        for (int i = 0; i < 100; i++) {
+        for (int i = 0; i < 1; i++) {
             try {
                 // 创建消息, 并指定Topic, Tag和消息体
                 byte[] messageBody = ("Source : Hello RocketMQ" + i).getBytes("UTF-8");

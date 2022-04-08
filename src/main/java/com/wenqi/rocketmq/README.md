@@ -528,7 +528,7 @@ this.scheduledExecutorService.scheduleAtFixedRate(new Runnable() {
 
 1. 收到Netty请求：
 
-​	org.apache.rocketmq.namesrv.processor.DefaultRequestProcessor#processRequest
+​	`org.apache.rocketmq.namesrv.processor.DefaultRequestProcessor#processRequest`
 
 ​	标识：request.getCode() = `RequestCode.REGISTER_BROKER`
 
@@ -666,6 +666,49 @@ public class DefaultMQProducer extends ClientConfig implements MQProducer {}
 public interface MQProducer extends MQAdmin {}
 ```
 
+- 启动
+
+`org.apache.rocketmq.client.impl.producer.DefaultMQProducerImpl#start(boolean)`
+
+主要是启动MQClientInstance实例，MQClientInstance封装与Broker和NameServer交互的信息。
+
+每个ClientId只有一个MQClientInstance实例（单例）。
+
+- send
+
+执行方法：
+
+`org.apache.rocketmq.client.impl.producer.DefaultMQProducerImpl#send(org.apache.rocketmq.common.message.Message)`
+
+执行步骤：
+
+1. 消息长度验证：`Validators.checkMessage(msg, this.defaultMQProducer);`
+2. 查找主题路由信息：`org.apache.rocketmq.client.impl.producer.DefaultMQProducerImpl#tryToFindTopicPublishInfo`
+3. 选择消息队列：`org.apache.rocketmq.client.impl.producer.DefaultMQProducerImpl#selectOneMessageQueue`
+4. 发送消息：`org.apache.rocketmq.client.impl.producer.DefaultMQProducerImpl#sendKernelImpl`
+
+注：
+
+> 生产者查找主题路由信息：
+>
+> 1. 先用topic为key从本地缓存中获取，没有则向NameServer中拉取到本地路由表，再从路由表中获取。
+> 2. 如果NameServer没有该Topic信息，则抛出异常MQClientException`ResponseCode.TOPIC_NOT_EXIST`
+> 3. 生产者捕获异常，使用默认Topic获取路由信息（TBW102，topic信息保存在defaultMQProducer），NameServer返回路由信息（默认路由信息一定会有，主要是broker地址，队列信息）
+> 4. 生产者发送消息，如果topic不存在，配置了autoCreateTopicEnable=true则发送成功，反之抛出异常：topic[" + requestHeader.getTopic() + "] not exist, apply first please!
+
+> 选择消息队列：
+>
+> - 故障延迟 sendLatencyFaultEnable = false
+>   1. 默认队列轮询算法（消息队列数取模），返回lastBrokerName，记录异常Broker，下次选择时可跳过，提高消息发送成功率。
+> - 故障延迟 sendLatencyFaultEnable = true
+>   1. 根据对消息队列进行轮询获取一个消息队列
+>   2. 验证该消息队列是否可用
+>   3. 如果返回MessageQueue可用，移除latencyFaultTolerance中关于该topic的条目，表明该Broker故障已经恢复
+>   
+
+Producer从NameServer中拉取到的路由信息如下图：
+
+从图中messageQueueList可以看出，其保存的是所有的broker的队列信息，然后轮询选择队列。因此sendMessage的负载均衡是队列的轮询而不是broker下的队列轮询。`org.apache.rocketmq.client.latency.MQFaultStrategy#selectOneMessageQueue`![topicPublishInfo](../../../../resources/pic/topicPublishInfo.png)
 
 
 ### Message
@@ -680,11 +723,25 @@ public interface MQProducer extends MQAdmin {}
 | keys           | 消息索引键，用空格隔开               |
 | waitStoreMsgOK | 消息发送时是否等消息储存完成后再返回 |
 
+### Broker
 
+处理发送信息请求：`org.apache.rocketmq.broker.processor.SendMessageProcessor#preSend`
 
+消息处理，包括是否自动创建Topic：`org.apache.rocketmq.broker.processor.AbstractSendMessageProcessor#msgCheck`
 
+- 启动
 
+​	如果配置了autoCreateTopicEnable=true，在Broker启动流程中，会构建TopicConfigManager对象，其构造方法中首先会判断是否开启了允许自动创建主题，如果启用了自动创建主题，则向topicConfigTable中添加默认主题的路由信息。
 
+`org.apache.rocketmq.broker.topic.TopicConfigManager#TopicConfigManager(org.apache.rocketmq.broker.BrokerController)`
+
+> 思考点
+
+1. 生产环境下 RocketMQ 为什么不能开启自动创建主题？
+
+   参考：https://cloud.tencent.com/developer/article/1449855。
+
+   主要是：多broker-master环境下，消息发送到一个broker-a，broker-a创建了Topic。此时broker-a没有同步新创建的Topic到NameServer（30s发一次心跳），所以broker-b上并没有新创建Topic的信息。当消息再次发送时，从NameServer拉取到的路由信息，或导致短时间内消息全部发送到有新创建的Topic的broker-a上，直到broker-b也创建新Topic，负载均衡机制才生效。
 
 
 
