@@ -735,13 +735,216 @@ Producer从NameServer中拉取到的路由信息如下图：
 
 `org.apache.rocketmq.broker.topic.TopicConfigManager#TopicConfigManager(org.apache.rocketmq.broker.BrokerController)`
 
-> 思考点
+## 思考点
 
-1. 生产环境下 RocketMQ 为什么不能开启自动创建主题？
+### 生产环境下 RocketMQ 为什么不能开启自动创建主题？
 
-   参考：https://cloud.tencent.com/developer/article/1449855。
+参考：https://cloud.tencent.com/developer/article/1449855。
 
-   主要是：多broker-master环境下，消息发送到一个broker-a，broker-a创建了Topic。此时broker-a没有同步新创建的Topic到NameServer（30s发一次心跳），所以broker-b上并没有新创建Topic的信息。当消息再次发送时，从NameServer拉取到的路由信息，或导致短时间内消息全部发送到有新创建的Topic的broker-a上，直到broker-b也创建新Topic，负载均衡机制才生效。
+主要是：多broker-master环境下，消息发送到一个broker-a，broker-a创建了Topic。此时broker-a没有同步新创建的Topic到NameServer（30s发一次心跳），所以broker-b上并没有新创建Topic的信息。当消息再次发送时，从NameServer拉取到的路由信息，或导致短时间内消息全部发送到有新创建的Topic的broker-a上，直到broker-b也创建新Topic，负载均衡机制才生效。
+
+### 关于TBW102的前生今世
+
+> 思考
+
+	1. TBW102有什么用？
+	1. autoCreateTopicEnable=false，NameServer中还是有TBW102的路由信息？
+
+> 作用
+
+Broker启动时，会构造TopicConfigManager。如果broker.conf设置了`autoCreateTopicEnable=true`，将会执行下述的代码，创建TBW102的路由信息，即：TopicValidator.AUTO_CREATE_TOPIC_KEY_TOPIC。
+
+TBW102路由信息创建完毕后，Broker会将路由信息注册到NameServer中，所以Proudcer在消息发送是都会拉取到Topic是TBW102的路由信息。
+
+```java
+if (this.brokerController.getBrokerConfig().isAutoCreateTopicEnable()) {
+    String topic = TopicValidator.AUTO_CREATE_TOPIC_KEY_TOPIC;
+    TopicConfig topicConfig = new TopicConfig(topic);
+    TopicValidator.addSystemTopic(topic);
+    topicConfig.setReadQueueNums(this.brokerController.getBrokerConfig()
+                                 .getDefaultTopicQueueNums());
+    topicConfig.setWriteQueueNums(this.brokerController.getBrokerConfig()
+                                  .getDefaultTopicQueueNums());
+    int perm = PermName.PERM_INHERIT | PermName.PERM_READ | PermName.PERM_WRITE;
+    topicConfig.setPerm(perm);
+    this.topicConfigTable.put(topicConfig.getTopicName(), topicConfig);
+}
+```
+
+> 两种场景（均基于Producer尝试发送一个不存在的Topic -> NotExistTopic，并且没有在Broker上手动创建Topic）：
+
+同步路由信息步骤：`org.apache.rocketmq.client.impl.producer.DefaultMQProducerImpl#tryToFindTopicPublishInfo`
+
+1. 指定Topic查找
+2. 默认Topic查找（TBW102）
+
+#### autoCreateTopicEnable=true
+
+Broker启动，创建TBW102信息同步到NameServer。发送消息是Producer拉取到TBW102的路由信息TopicPublishInfo，并利用TBW102的路由信息来构造一个要发送Topic -> NotExistTopic的路由信息NewTopicPublishInfo。
+
+`org.apache.rocketmq.client.impl.factory.MQClientInstance#topicRouteData2TopicPublishInfo`
+
+Producer携带NewTopicPublishInfo发送消息到Broker，Broker发现路由NotExistTopic不存在，而且autoCreateTopicEnable=true，因此Broker利用NewTopicPublishInfo的信息创建一个新的Topic -> NotExistTopic，并将消息转存到NotExistTopic中。
+
+`org.apache.rocketmq.broker.processor.AbstractSendMessageProcessor#msgCheck`
+
+`org.apache.rocketmq.broker.topic.TopicConfigManager#createTopicInSendMessageMethod`
+
+
+
+![](https://s7.51cto.com/images/blog/202106/07/0398e12d9367bdf2cf44c544a54e5a11.jpeg)
+
+#### autoCreateTopicEnable=false
+
+流程上与autoCreateTopicEnable=true基本一致，唯一区别是消息发送到Broker时，Broker不会创建Topic，而是返回错误信息：`topic[" + requestHeader.getTopic() + "] not exist, apply first please!`
+
+#### 为什么TWB102一直存在
+
+这里有个疑问：为什么autoCreateTopicEnable=false还能在NameServer中拉取到TBW102的路由信息，是不是遗留的Bug呀？
+
+找了很久才找到的解析：https://github.com/apache/rocketmq/issues/3179
+
+==原因解析：==
+
+1. 构造生产者实例，调用start()方法
+
+```java
+ DefaultMQProducer producer = new DefaultMQProducer("source-producer-quick-start");
+ producer.start();
+```
+
+2. start()方法中会调用到DefaultMQProducerImpl.start()
+
+​	`org.apache.rocketmq.client.impl.producer.DefaultMQProducerImpl#start()`
+
+3. 构造TWB102的路由信息，并启动MQClientInstance实例
+
+`org.apache.rocketmq.client.impl.producer.DefaultMQProducerImpl#start(boolean)`
+
+```java
+public void start(final boolean startFactory) throws MQClientException {
+    switch (this.serviceState) {
+        case CREATE_JUST:
+            // 保存TBW102的路由信息到topicPublishInfoTable中
+            this.topicPublishInfoTable.put(this.defaultMQProducer.getCreateTopicKey(), new TopicPublishInfo());
+
+            // 启动MQClientInstance实例，同步TBW102路由信息到NameServer的关键方法
+            if (startFactory) {
+                mQClientFactory.start();
+            }        
+        case RUNNING:
+        case START_FAILED:
+        case SHUTDOWN_ALREADY:
+            // 省略 ... 
+        default:
+            break;
+    }
+}
+```
+
+4. 定时任务同步TBW102路由信息到NameServer中
+
+MQClientInstance启动的定时任务：`org.apache.rocketmq.client.impl.factory.MQClientInstance#start`
+
+```java
+public void start() throws MQClientException {
+    synchronized (this) {
+        switch (this.serviceState) {
+            case CREATE_JUST:
+                // Start various schedule tasks
+                // 相关的定时任务
+                this.startScheduledTask();
+                break;
+            case RUNNING:
+                break;
+            case SHUTDOWN_ALREADY:
+                break;
+            case START_FAILED:
+                throw new MQClientException("The Factory object[" + this.getClientId() + "] has been created before, and failed.", null);
+            default:
+                break;
+        }
+    }
+}
+```
+
+
+```java
+private void startScheduledTask() {
+    // 同步路由信息的定时任务
+    this.scheduledExecutorService.scheduleAtFixedRate(new Runnable() {
+
+        @Override
+        public void run() {
+            try {
+                MQClientInstance.this.updateTopicRouteInfoFromNameServer();
+            } catch (Exception e) {
+                log.error("ScheduledTask updateTopicRouteInfoFromNameServer exception", e);
+            }
+        }
+    }, 10, this.clientConfig.getPollNameServerInterval(), TimeUnit.MILLISECONDS);
+}
+```
+
+5. 同步路由信息到NameServer方法
+
+`org.apache.rocketmq.client.impl.factory.MQClientInstance#updateTopicRouteInfoFromNameServer()`
+
+
+```java
+public void updateTopicRouteInfoFromNameServer() {
+    Set<String> topicList = new HashSet<String>();
+
+    // Consumer
+    {
+        Iterator<Entry<String, MQConsumerInner>> it = this.consumerTable.entrySet().iterator();
+        while (it.hasNext()) {
+            Entry<String, MQConsumerInner> entry = it.next();
+            MQConsumerInner impl = entry.getValue();
+            if (impl != null) {
+                Set<SubscriptionData> subList = impl.subscriptions();
+                if (subList != null) {
+                    for (SubscriptionData subData : subList) {
+                        topicList.add(subData.getTopic());
+                    }
+                }
+            }
+        }
+    }
+
+    // Producer
+    {
+        Iterator<Entry<String, MQProducerInner>> it = this.producerTable.entrySet().iterator();
+        while (it.hasNext()) {
+            Entry<String, MQProducerInner> entry = it.next();
+            MQProducerInner impl = entry.getValue();
+            if (impl != null) {
+                Set<String> lst = impl.getPublishTopicList();
+                topicList.addAll(lst);
+            }
+        }
+    }
+
+    for (String topic : topicList) {
+        // broker中的每个Topic都同步到NameServer中，当然包括刚刚构造的TBW102啦
+        this.updateTopicRouteInfoFromNameServer(topic);
+    }
+}
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
