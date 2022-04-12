@@ -666,7 +666,7 @@ public class DefaultMQProducer extends ClientConfig implements MQProducer {}
 public interface MQProducer extends MQAdmin {}
 ```
 
-- 启动
+##### 启动
 
 `org.apache.rocketmq.client.impl.producer.DefaultMQProducerImpl#start(boolean)`
 
@@ -674,7 +674,7 @@ public interface MQProducer extends MQAdmin {}
 
 每个ClientId只有一个MQClientInstance实例（单例）。
 
-- send
+##### send
 
 执行方法：
 
@@ -709,6 +709,189 @@ public interface MQProducer extends MQAdmin {}
 Producer从NameServer中拉取到的路由信息如下图：
 
 从图中messageQueueList可以看出，其保存的是所有的broker的队列信息，然后轮询选择队列。因此sendMessage的负载均衡是队列的轮询而不是broker下的队列轮询。`org.apache.rocketmq.client.latency.MQFaultStrategy#selectOneMessageQueue`![topicPublishInfo](../../../../resources/pic/topicPublishInfo.png)
+
+##### Broker故障规避机制
+
+1. 消息发送方法
+
+`org.apache.rocketmq.client.impl.producer.DefaultMQProducerImpl#sendDefaultImpl`
+
+```java
+// 消息发送失败重试
+for (; times < timesTotal; times++) {
+    // 注意这个是重试逻辑
+    // 第一次循环：mq = null， 即lastBrokerName = null
+    // 2次以上循环：此时mq已经被赋值了（mq = mqSelected），mq等于上一次发送失败的队列MessageQueue，此时lastBrokerName等于上次发送失败的brokerName
+    // 相当于这里记录了发送失败的brokerName了
+    String lastBrokerName = null == mq ? null : mq.getBrokerName();
+    // 选择队列, 故障规避核心方法
+    MessageQueue mqSelected = this.selectOneMessageQueue(topicPublishInfo, lastBrokerName);
+    if (mqSelected != null) {
+        // mq等于选择出的队列
+        mq = mqSelected;
+        brokersSent[times] = mq.getBrokerName();
+        try {
+            beginTimestampPrev = System.currentTimeMillis();
+		   // 消息发送
+            sendResult = this.sendKernelImpl(msg, mq, communicationMode, sendCallback, topicPublishInfo, timeout - costTime);
+            endTimestamp = System.currentTimeMillis();
+            // 发送完毕之后, 更新Broker的信息
+            // 消息发送消耗时间: endTimestamp - beginTimestampPrev
+            this.updateFaultItem(mq.getBrokerName(), endTimestamp - beginTimestampPrev, false);
+        }
+    }
+}
+```
+
+2. 记录不可用Broker的核心方法
+
+sendLatencyFaultEnable = true时，才会调用该方法记录
+
+`org.apache.rocketmq.client.impl.producer.DefaultMQProducerImpl#updateFaultItem`
+
+```java
+// 更新Broker的信息
+// sendLatencyFaultEnable = true开启故障规避机制, 默认时false
+// isolation = true : currentLatency = 30s
+// isolation = false : currentLatency = 消息发送消耗时间 = endTimestamp - beginTimestampPrev
+public void updateFaultItem(final String brokerName, final long currentLatency, boolean isolation) {
+    if (this.sendLatencyFaultEnable) {
+        long duration = computeNotAvailableDuration(isolation ? 30000 : currentLatency);
+        this.latencyFaultTolerance.updateFaultItem(brokerName, currentLatency, duration);
+    }
+}
+
+// 规避时间计算
+// 算法: 从latencyMax数组尾部开始寻找，找到第一个比currentLatency小的下标，
+// 然后从notAvailableDuration数组中获取需要规避的时长
+private long computeNotAvailableDuration(final long currentLatency) {
+    for (int i = latencyMax.length - 1; i >= 0; i--) {
+        if (currentLatency >= latencyMax[i])
+            return this.notAvailableDuration[i];
+    }
+
+    return 0;
+}
+
+// 规避策略
+private long[] latencyMax = {50L, 100L, 550L, 1000L, 2000L, 3000L, 15000L};
+private long[] notAvailableDuration = {0L, 0L, 30000L, 60000L, 120000L, 180000L, 600000L};
+```
+
+3. 选择队列方法，Broker故障规避核心方法
+
+`org.apache.rocketmq.client.latency.MQFaultStrategy#selectOneMessageQueue`
+
+```java
+// 选择队列
+public MessageQueue selectOneMessageQueue(final TopicPublishInfo tpInfo, final String lastBrokerName) {
+    // 是否开启Broker故障规避
+    if (this.sendLatencyFaultEnable) {
+        try {
+            int index = tpInfo.getSendWhichQueue().getAndIncrement();
+            for (int i = 0; i < tpInfo.getMessageQueueList().size(); i++) {
+                int pos = Math.abs(index++) % tpInfo.getMessageQueueList().size();
+                if (pos < 0)
+                    pos = 0;
+                // 所有的Broker队列中，轮询选择一个队列
+                MessageQueue mq = tpInfo.getMessageQueueList().get(pos);
+                // 检查这个brokerName是否可用，如果broker不可用每次消息发送都会记录下来
+                if (latencyFaultTolerance.isAvailable(mq.getBrokerName())) {
+                    // 如果是第一次发送，或者broker是可用的并与上次发送失败的broker一样，则返回此broker
+                    if (null == lastBrokerName || mq.getBrokerName().equals(lastBrokerName))
+                        return mq;
+                }
+            }
+
+            // 上面没找到broker，则尝试从规避的Broker中选择一个可用的Broker，如果没有找到，则返回null。
+            final String notBestBroker = latencyFaultTolerance.pickOneAtLeast();
+            // 根据notBestBroker获取该队列信息，如果broker已经断开则没有路由信息，writeQueueNums返回-1
+            int writeQueueNums = tpInfo.getQueueIdByBroker(notBestBroker);
+            if (writeQueueNums > 0) {
+                final MessageQueue mq = tpInfo.selectOneMessageQueue();
+                if (notBestBroker != null) {
+                    mq.setBrokerName(notBestBroker);
+                    mq.setQueueId(tpInfo.getSendWhichQueue().getAndIncrement() % writeQueueNums);
+                }
+                return mq;
+            } else {
+                latencyFaultTolerance.remove(notBestBroker);
+            }
+        } catch (Exception e) {
+            log.error("Error occurred when selecting message queue", e);
+        }
+
+        return tpInfo.selectOneMessageQueue();
+    }
+	// 没开启故障规避，直接根据BrokerName选择队列
+    return tpInfo.selectOneMessageQueue(lastBrokerName);
+}
+```
+
+4. 执行队列选择
+
+`org.apache.rocketmq.client.impl.producer.TopicPublishInfo#selectOneMessageQueue(java.lang.String)`
+
+```java
+public MessageQueue selectOneMessageQueue(final String lastBrokerName) {
+    // 第一次发送消息，lastBrokerName = null, 直接进行队列选择
+    if (lastBrokerName == null) {
+        return selectOneMessageQueue();
+    } else {
+        int index = this.sendWhichQueue.getAndIncrement();
+        for (int i = 0; i < this.messageQueueList.size(); i++) {
+            int pos = Math.abs(index++) % this.messageQueueList.size();
+            if (pos < 0)
+                pos = 0;
+            // 所有的Broker队列中，轮询选择一个队列
+            MessageQueue mq = this.messageQueueList.get(pos);
+            // 判断是否是上一次发送失败的broker
+            // lastBrokerName != null, lastBrokerName就代表上次发送失败的brokerName
+            if (!mq.getBrokerName().equals(lastBrokerName)) {
+                // 返回一个非上次失败的broker
+                return mq;
+            }
+        }
+        return selectOneMessageQueue();
+    }
+}
+
+// 所有的Broker队列中，轮询选择一个队列
+public MessageQueue selectOneMessageQueue() {
+    int index = this.sendWhichQueue.getAndIncrement();
+    int pos = Math.abs(index) % this.messageQueueList.size();
+    if (pos < 0)
+        pos = 0;
+    return this.messageQueueList.get(pos);
+}
+```
+
+5. Broker故障延迟机制核心类
+
+`org.apache.rocketmq.client.latency.LatencyFaultTolerance`
+
+```java
+public interface LatencyFaultTolerance<T> {
+    // 记录失败的Broker
+    void updateFaultItem(final T name, final long currentLatency, final long notAvailableDuration);
+	// 该Broker是否可用
+    // 可用判断：没有记录Broker信息或该Broker已过规避时间
+    boolean isAvailable(final T name);
+	// 移除失败的Broker
+    void remove(final T name);
+	// 尝试从规避的Broker中选择一个可用的Broker，如果没有找到，则返回null。
+    T pickOneAtLeast();
+}
+```
+
+> 从上述源码剖析可以看出：
+>
+> - 无论开启与不开启sendLatencyFaultEnable机制在消息发送时都能规避故障的Broker，见步骤4队列选择。
+>
+> - sendLatencyFaultEnable = true：一种较为悲观的做法。当消息发送者遇到一次消息发送失败后，就会悲观地认为Broker不可用，在接下来的一段时间内就不再向其发送消息，直接避开该Broker。
+>
+> - sendLatencyFaultEnable = false：只会在本次消息发送的重试过程中规避该Broker，下一次消息发送还是会继续尝试。
+
 
 
 ### Message
