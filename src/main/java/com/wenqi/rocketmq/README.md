@@ -129,6 +129,48 @@ private String messageDelayLevel = "1s 5s 10s 30s 1m 2m 3m 4m 5m 6m 7m 8m 9m 10m
 
 `waitStoreMsgOK`：消息发送时是否等消息存储完成后再返回。
 
+批量消息不支持发送到Retry Group延时消息，而且这批消息的状态应该一样：`org.apache.rocketmq.common.message.MessageBatch#generateFromList`
+
+```java
+public static MessageBatch generateFromList(Collection<Message> messages) {
+    assert messages != null;
+    assert messages.size() > 0;
+    List<Message> messageList = new ArrayList<Message>(messages.size());
+    Message first = null;
+    for (Message message : messages) {
+        // 不支持延时消息
+        if (message.getDelayTimeLevel() > 0) {
+            throw new UnsupportedOperationException("TimeDelayLevel is not supported for batching");
+        }
+        
+        // 不支持重试发到重试分组
+        if (message.getTopic().startsWith(MixAll.RETRY_GROUP_TOPIC_PREFIX)) {
+            throw new UnsupportedOperationException("Retry Group is not supported for batching");
+        }
+        if (first == null) {
+            first = message;
+        } else {
+            // 每条消息的Topic应该一致
+            if (!first.getTopic().equals(message.getTopic())) {
+                throw new UnsupportedOperationException("The topic of the messages in one batch should be the same");
+            }
+            // 每条消息的isWaitStoreMsgOK应该一致
+            if (first.isWaitStoreMsgOK() != message.isWaitStoreMsgOK()) {
+                throw new UnsupportedOperationException("The waitStoreMsgOK of the messages in one batch should the same");
+            }
+        }
+        messageList.add(message);
+    }
+    MessageBatch messageBatch = new MessageBatch(messageList);
+
+    messageBatch.setTopic(first.getTopic());
+    messageBatch.setWaitStoreMsgOK(first.isWaitStoreMsgOK());
+    return messageBatch;
+}
+```
+
+
+
 ### 事务消息
 
 分布式事务与传统事务:
@@ -595,6 +637,8 @@ org.apache.rocketmq.namesrv.processor.DefaultRequestProcessor#getRouteInfoByTopi
 
 #### Send
 
+##### 流程
+
 > 发送高可用
 
 1. 重试机制：默认2次；
@@ -654,6 +698,122 @@ org.apache.rocketmq.namesrv.processor.DefaultRequestProcessor#getRouteInfoByTopi
 
 ![send-msg](../../../../resources/pic/send-msg.png)
 
+##### 发送同步消息SYNC
+
+1. DefaultMQProducerImpl构造消息
+
+​	构造RequestHeader，消息发送前后的钩子函数处理。
+
+​	`org.apache.rocketmq.client.impl.producer.DefaultMQProducerImpl#sendKernelImpl`
+
+​	`org.apache.rocketmq.client.hook.SendMessageHook`
+
+2. 委托客户端MQClientAPIImpl处理并发送消息
+
+​	设置请求code：`RequestCode.SEND_MESSAGE` 
+
+​	`org.apache.rocketmq.client.impl.MQClientAPIImpl#sendMessage(java.lang.String, java.lang.String, org.apache.rocketmq.common.message.Message, org.apache.rocketmq.common.protocol.header.SendMessageRequestHeader, long, org.apache.rocketmq.client.impl.CommunicationMode, org.apache.rocketmq.client.producer.SendCallback, org.apache.rocketmq.client.impl.producer.TopicPublishInfo, org.apache.rocketmq.client.impl.factory.MQClientInstance, int, org.apache.rocketmq.client.hook.SendMessageContext, org.apache.rocketmq.client.impl.producer.DefaultMQProducerImpl)`
+
+3. Broker处理消息并返回
+
+   - Broker接受消息请求：`org.apache.rocketmq.broker.processor.SendMessageProcessor#processRequest`
+
+   - 校验并返回消息结果：`org.apache.rocketmq.broker.processor.SendMessageProcessor#asyncSendMessage`
+
+```java
+private CompletableFuture<RemotingCommand> asyncSendMessage(ChannelHandlerContext ctx, RemotingCommand request,
+                                                                SendMessageContext mqtraceContext,
+                                                                SendMessageRequestHeader requestHeader) {
+    // 1. 检查消息的核心方法
+    // a. 检查Broker是否有写权限（没有创建的Topic，继承至TBW102）
+    // b. 检查Topic和队列，包括权限、是否存在、是否合法等
+    final RemotingCommand response = preSend(ctx, request, requestHeader);
+    final SendMessageResponseHeader responseHeader = (SendMessageResponseHeader)response.readCustomHeader();
+
+    if (response.getCode() != -1) {
+        return CompletableFuture.completedFuture(response);
+    }
+
+    final byte[] body = request.getBody();
+
+    int queueIdInt = requestHeader.getQueueId();
+    TopicConfig topicConfig = this.brokerController.getTopicConfigManager().selectTopicConfig(requestHeader.getTopic());
+
+    if (queueIdInt < 0) {
+        queueIdInt = randomQueueId(topicConfig.getWriteQueueNums());
+    }
+
+    MessageExtBrokerInner msgInner = new MessageExtBrokerInner();
+    msgInner.setTopic(requestHeader.getTopic());
+    msgInner.setQueueId(queueIdInt);
+
+    // 如果消息重试次数超过允许的最大重试次数，消息将进入DLQ死信队列。死信队列主题为%DLQ%+消费组名。
+    if (!handleRetryAndDLQ(requestHeader, response, request, msgInner, topicConfig)) {
+        return CompletableFuture.completedFuture(response);
+    }
+
+    // 省略 ...
+    
+    CompletableFuture<PutMessageResult> putMessageResult = null;
+    String transFlag = origProps.get(MessageConst.PROPERTY_TRANSACTION_PREPARED);
+    // 事务消息处理，保存为half消息
+    if (transFlag != null && Boolean.parseBoolean(transFlag)) {
+        if (this.brokerController.getBrokerConfig().isRejectTransactionMessage()) {
+            response.setCode(ResponseCode.NO_PERMISSION);
+            response.setRemark(
+                "the broker[" + this.brokerController.getBrokerConfig().getBrokerIP1()
+                + "] sending transaction message is forbidden");
+            return CompletableFuture.completedFuture(response);
+        }
+        putMessageResult = this.brokerController.getTransactionalMessageService().asyncPrepareMessage(msgInner);
+    } else {
+        // 非事务消息的保存，调用org.apache.rocketmq.store.MessageStore#putMessage
+        putMessageResult = this.brokerController.getMessageStore().asyncPutMessage(msgInner);
+    }
+    // 保存消息后，返回结果的处理
+    return handlePutMessageResultFuture(putMessageResult, response, request, msgInner, responseHeader, mqtraceContext, ctx, queueIdInt);
+}
+```
+
+##### 发送异步消息ASYNC
+
+- 异步消息发送与同步发送逻辑大致相同，异步发送无须等待消息服务器返回本次消息发送的结果，只需要提供一个回调函数，供消息发送客户端在收到响应结果后回调。
+
+- 异步的并发控制，通过参数clientAsyncSemaphoreValue实现，默认为65535。
+
+- retryTimesWhenSendAsyncFailed属性来控制消息的发送重试次数，但是重试的调用入口是在收到服务端响
+  应包时进行的，如果出现网络异常、网络超时等情况将不会重试。
+
+##### 单向发送消息ONEWAY
+
+单向消息发送客户端在收到响应结果后什么都不做了，并且没有重试机制。
+
+##### 关于重试
+
+- oneway没有重试，通过控制setRetryTimesWhenSendFailed和retryTimesWhenSendAsyncFailed参数来控制sync和async的重试次数。
+
+- oneway没有重试的原因是，没有解析broker返回response，而sync和async都有解析并抛出相关异常来进行重试。包括`RemotingException`、`MQClientException`、`MQBrokerException`、`InterruptedException`
+
+- sync和async重试处理地方不同
+  - sync：`org.apache.rocketmq.client.impl.producer.DefaultMQProducerImpl#sendDefaultImpl`
+
+  ```java
+  // 除了sync指定重试次数，aync和oneway都是1
+  int timesTotal = communicationMode == CommunicationMode.SYNC ? 1 + this.defaultMQProducer.getRetryTimesWhenSendFailed() : 1;
+  ```
+
+  - async：`org.apache.rocketmq.client.impl.MQClientAPIImpl#sendMessageAsync`
+
+
+
+
+
+
+
+
+
+
+
 
 
 #### DefaultMQProducer
@@ -675,6 +835,8 @@ public interface MQProducer extends MQAdmin {}
 每个ClientId只有一个MQClientInstance实例（单例）。
 
 ##### send
+
+流程
 
 执行方法：
 
@@ -905,6 +1067,10 @@ public interface LatencyFaultTolerance<T> {
 | tags           | 消息tag，用于消息过滤                |
 | keys           | 消息索引键，用空格隔开               |
 | waitStoreMsgOK | 消息发送时是否等消息储存完成后再返回 |
+
+批量消息发送前会把消息列表压缩一遍，编码和解码的工作都是MessageDecoder来完成。
+
+
 
 ### Broker
 
