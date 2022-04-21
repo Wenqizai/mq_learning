@@ -4,7 +4,7 @@ Apache中文文档：https://www.itmuch.com/books/rocketmq/RocketMQ_Example.html
 
 ![MQ对比](https://images2017.cnblogs.com/blog/178437/201711/178437-20171116111559109-292574107.png)
 
-## 概念
+# 概念
 
 ### Topic
 
@@ -28,7 +28,7 @@ Apache中文文档：https://www.itmuch.com/books/rocketmq/RocketMQ_Example.html
 
 Tag 和 Key 的主要差别是使用场景不同，Tag 用在 Consumer 代码中，用于服务端消息过滤Key 主要用于通过命令进行查找消息。`RocketMQ` 并不能保证 message id 唯一，在这种情况下，生产者在 push 消息的时候可以给每条消息设定唯一的 key, 消费者可以通过 message key保证对消息幂等处理。
 
-## Quick Start
+# Quick Start
 
 ### Producer(普通消息)
 
@@ -307,7 +307,7 @@ Consumer consumer = ONSFactory.createConsumer(properties);
 - 广播模式下，每条消息都会被大量的客户端重复处理，因此推荐尽可能使用集群模式。
 - 广播模式下服务端不维护消费进度，所以消息队列RocketMQ版控制台不支持消息堆积查询、消息堆积报警和订阅关系查询功能。
 
-## 实践
+# 实践
 
 ### 可靠信息
 
@@ -447,7 +447,7 @@ public ConsumeConcurrentlyStatus consumeMessage(List<MessageExt> msgs, ConsumeCo
 
 参看：https://help.aliyun.com/document_detail/43523.htm?spm=a2c4g.11186623.0.0.5c4a180a4yjrSG
 
-## 源码
+# 源码
 
 ### 问题点（待解决）
 
@@ -1084,7 +1084,87 @@ public interface LatencyFaultTolerance<T> {
 
 `org.apache.rocketmq.broker.topic.TopicConfigManager#TopicConfigManager(org.apache.rocketmq.broker.BrokerController)`
 
-## 思考点
+### 消息存储
+
+![消息处理流程](../../../../resources/pic/msg-handle.png)
+
+#### 储存文件
+
+1. `commitlog`：消息存储，所有消息主题的消息都存储再commitlog文件中；
+2. `consumequeue`：消息消费队列，消息到达commitlog文件后，将异步转发到consumequeue文件中，供消息消费者消费；
+3. `index`：消息索引，主要存储消息key与offset的对应关系。
+
+三者关系图：
+
+![关系图](https://s2.51cto.com/oss/202110/15/f630a52e3239c29e87a6622521751294.png)
+
+==简单来说：commitlog储存消息，consumequeue绑定Topic关联的producer和consumer分发的消息，index用来查找消息。==
+
+#### commitlog
+
+![commitlog](../../../../resources/pic/commitlog-file.png)
+
+commitlog的消息写入是顺序写入，一旦写入不允许修改（极致利用磁盘顺序写特性），命名是以偏移量来命名，如第一个CommitLog文件为0000000000000000000，第二个CommitLog文件为00000000001073741824，依次类推。
+
+1个commitlog文件大小是1G，第二个文件的开始偏移是1G = 1024 * 1024 * 1024B = 1073741824
+
+#### consumequeue
+
+![commitlog](../../../../resources/pic/consumequeue-file.png)
+
+consumequeue消息条目固定20字节，并提供index来快速定位消息条目，提高读性能。同时，由于每个消息固定20字节，就可以利用逻辑偏移计算来定位条目，无需再遍历整个consumequeue文件。
+
+#### index
+<img src="../../../../resources/pic/index-file.png" alt="commitlog"  />
+
+> Header
+
+- beginTimeStamp：第一个消息Message落盘存储的时间（消息存储到 CommitLog 的时间）
+
+- endTimeStamp：最晚消息Message落盘存储的时间
+- beginPhyOffset：存储的消息的最小物理偏移量（在 CommitLog 中的偏移量）
+- endPhyOffset：存储的消息的最大物理偏移量
+- HashSlot Count：最大可存储的 hash 槽个数
+- Index Count：当前已经使用的索引条目个数。注意这个值是从 1 开始
+
+> Slot Table
+
+该数值可通过broker.conf中`maxIndexNum`配置，储存index条目的索引。
+
+> Index Linked List
+
+- HashCode
+
+  消息的 Topic 和 Message Key 经过哈希得到的整数（Topic+Message Key模糊查询，因为存在Hash冲突）。
+
+- PhyOffset
+
+  消息在 CommitLog 中的物理偏移量，用于到 CommitLog 中查询消息。
+
+- timedif
+
+  Message的落盘时间与header里的beginTimestamp的差值（精确到秒），用于根据时间范围查询消息
+
+- pre index no
+
+​	 hash冲突处理的关键之处，相同hash值上一个消息索引的index（如果当前消息索引是该hash值的第一个索引，则prevIndex=0, 也是消息索引查找时的停止条件）
+
+#### 页缓存
+
+RocketMQ引用内存映射，将磁盘文件加载到内存中，极大提升文件的读写性能。
+
+
+
+
+
+
+
+
+
+
+
+
+# 思考点
 
 ### 生产环境下 RocketMQ 为什么不能开启自动创建主题？
 
@@ -1281,7 +1361,11 @@ public void updateTopicRouteInfoFromNameServer() {
 }
 ```
 
+### RocketMQ性能改良
 
+1、 commitlog，consumequeue和index文件顺序写，consumequeue通过索引访问，条目固定大小，可通过逻辑偏移量访问。
+
+2、 页缓存的引入
 
 
 
