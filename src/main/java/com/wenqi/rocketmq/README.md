@@ -1,6 +1,10 @@
+# 文档
+
 Apache中文文档：https://www.itmuch.com/books/rocketmq/RocketMQ_Example.html
 
 阿里云文档：https://help.aliyun.com/product/29530.html?spm=a2c4g.11186623.0.0.506c538aBXXtUy
+
+控制台查询消息：https://help.aliyun.com/document_detail/29540.html
 
 ![MQ对比](https://images2017.cnblogs.com/blog/178437/201711/178437-20171116111559109-292574107.png)
 
@@ -1088,6 +1092,58 @@ public interface LatencyFaultTolerance<T> {
 
 ![消息处理流程](../../../../resources/pic/msg-handle.png)
 
+#### 存储流程
+
+1. 检查是否能够写入(broker slave 消息合法性)
+
+`org.apache.rocketmq.store.DefaultMessageStore#checkStoreStatus`
+
+`org.apache.rocketmq.store.DefaultMessageStore#checkMessage`
+
+2. 消息的延迟级别大于0，设置延迟队列的Topic和queueId
+3. 获取当前可以写入的CommitLog文件
+
+```java
+putMessageLock.lock(); //spin or ReentrantLock ,depending on store config
+try {
+    MappedFile mappedFile = this.mappedFileQueue.getLastMappedFile();
+    long beginLockTimestamp = this.defaultMessageStore.getSystemClock().now();
+    this.beginTimeInLock = beginLockTimestamp;
+
+    // Here settings are stored timestamp, in order to ensure an orderly
+    // global
+    msg.setStoreTimestamp(beginLockTimestamp);
+
+    if (null == mappedFile || mappedFile.isFull()) {
+        mappedFile = this.mappedFileQueue.getLastMappedFile(0); // Mark: NewFile may be cause noise
+    }
+    if (null == mappedFile) {
+        log.error("create mapped file1 error, topic: " + msg.getTopic() + " clientAddr: " + msg.getBornHostString());
+        return CompletableFuture.completedFuture(new PutMessageResult(PutMessageStatus.CREATE_MAPEDFILE_FAILED, null));
+    }
+}
+```
+
+4. 将消息追加到文件中
+
+`org.apache.rocketmq.store.MappedFile#appendMessagesInner`
+
+5. 创建MsgId
+
+```java
+Supplier<String> msgIdSupplier = () -> {
+    int sysflag = msgInner.getSysFlag();
+    int msgIdLen = (sysflag & MessageSysFlag.STOREHOSTADDRESS_V6_FLAG) == 0 ? 4 + 4 + 8 : 16 + 4 + 8;
+    ByteBuffer msgIdBuffer = ByteBuffer.allocate(msgIdLen);
+    MessageExt.socketAddress2ByteBuffer(msgInner.getStoreHost(), msgIdBuffer);
+    msgIdBuffer.clear();//because socketAddress2ByteBuffer flip the buffer
+    msgIdBuffer.putLong(msgIdLen - 8, wroteOffset);
+    return UtilAll.bytes2string(msgIdBuffer.array());
+};
+```
+
+
+
 #### 储存文件
 
 1. `commitlog`：消息存储，所有消息主题的消息都存储再commitlog文件中；
@@ -1108,6 +1164,25 @@ commitlog的消息写入是顺序写入，一旦写入不允许修改（极致�
 
 1个commitlog文件大小是1G，第二个文件的开始偏移是1G = 1024 * 1024 * 1024B = 1073741824
 
+##### Message ID
+![msgid](../../../../resources/pic/msgid.png)
+
+全局唯一消息ID，共16字节。
+
+生成：`org.apache.rocketmq.store.CommitLog.DefaultAppendMessageCallback#doAppend(long, java.nio.ByteBuffer, int, org.apache.rocketmq.store.MessageExtBrokerInner, org.apache.rocketmq.store.CommitLog.PutMessageContext)`
+
+```java
+Supplier<String> msgIdSupplier = () -> {
+    int sysflag = msgInner.getSysFlag();
+    int msgIdLen = (sysflag & MessageSysFlag.STOREHOSTADDRESS_V6_FLAG) == 0 ? 4 + 4 + 8 : 16 + 4 + 8;
+    ByteBuffer msgIdBuffer = ByteBuffer.allocate(msgIdLen);
+    MessageExt.socketAddress2ByteBuffer(msgInner.getStoreHost(), msgIdBuffer);
+    msgIdBuffer.clear();//because socketAddress2ByteBuffer flip the buffer
+    msgIdBuffer.putLong(msgIdLen - 8, wroteOffset);
+    return UtilAll.bytes2string(msgIdBuffer.array());
+};
+```
+
 #### consumequeue
 
 ![commitlog](../../../../resources/pic/consumequeue-file.png)
@@ -1119,11 +1194,11 @@ consumequeue消息条目固定20字节，并提供index来快速定位消息条�
 
 > Header
 
-- beginTimeStamp：第一个消息Message落盘存储的时间（消息存储到 CommitLog 的时间）
+- beginTimeStamp：Index文件中消息的最小存储时间
 
-- endTimeStamp：最晚消息Message落盘存储的时间
-- beginPhyOffset：存储的消息的最小物理偏移量（在 CommitLog 中的偏移量）
-- endPhyOffset：存储的消息的最大物理偏移量
+- endTimeStamp：Index文件中消息的最大存储时间
+- beginPhyOffset：Index文件中存储的消息的最小物理偏移量
+- endPhyOffset：Index文件中存储的消息的最大物理偏移量
 - HashSlot Count：最大可存储的 hash 槽个数
 - Index Count：当前已经使用的索引条目个数。注意这个值是从 1 开始
 
@@ -1149,19 +1224,31 @@ consumequeue消息条目固定20字节，并提供index来快速定位消息条�
 
 ​	 hash冲突处理的关键之处，相同hash值上一个消息索引的index（如果当前消息索引是该hash值的第一个索引，则prevIndex=0, 也是消息索引查找时的停止条件）
 
+#### checkpoint
+
+checkpoint用来记录commitlog，consumeQueue，Index文件刷盘时间点。
+
+![checkpoint](../../../../resources/pic/checkpoint.png)
+
+- PhysicMsgTimestamp：commitlog文件刷盘时间点
+- LogicsMsgTimestamp：consumequeue文件刷盘时间点
+- IndexTimestamp：index文件刷盘时间点
+
 #### 页缓存
 
 RocketMQ引用内存映射，将磁盘文件加载到内存中，极大提升文件的读写性能。
 
+#### 刷盘
+
+> 同步刷盘
 
 
 
 
 
+> 异步刷盘
 
-
-
-
+默认方式
 
 
 # 思考点
@@ -1365,21 +1452,43 @@ public void updateTopicRouteInfoFromNameServer() {
 
 1、 commitlog，consumequeue和index文件顺序写，consumequeue通过索引访问，条目固定大小，可通过逻辑偏移量访问。
 
-2、 页缓存的引入
+2、 页缓存的引入(内存映射文件)
 
+### 宕机后的数据恢复
 
+`RocketMQ`是将消息全量存储在`CommitLog`文件中，并异步生成转发任务更新`ConsumeQueue`文件、Index文件。如果消息成功存储到`CommitLog`文件中，转发任务未成功执行，此时消息服务器Broker由于某个原因宕机，就会导致文件、`ConsumeQueue`文件、`Index`文件中的数据不一致。如果不加以人工修复，会有一部分消息即便在`CommitLog`文件中存在，由于并没有转发到`ConsumeQueue`文件，也永远不会被消费者消费。
 
+存储启动时所谓的文件恢复主要完成`flushedPosition`、`committedWhere`指针的设置、将消息消费队列最大偏移量加载到内存，并删除`flushedPosition`之后所有的文件。如果Broker异常停止，在文件恢复过程中，~会将最后一个有效文件中的所有消息重新转发到`ConsumeQueue`和`Index`文件中，确保不丢失消息，但同时会带来消息重复的问题。纵观`RocktMQ`的整体设计思想，`RocketMQ`保证消息不丢失但不保证消息不会重复消费，故消息消费业务方需要实现消息消费的幂等设计。
 
+`org.apache.rocketmq.store.DefaultMessageStore#load`
 
+> 1.  判断上一次退出是否正常。
 
+其实现机制是Broker在启动时创建${ROCKET_HOME}/store/abort文件，在退出时通过注册`JVM`钩子函数删除abort文件。如果下一次启动时存在abort文件。说明Broker是异常退出的，`CommitLog`与`ConsumeQueue`数据有可能不一致，需要进行修复。
 
+> 2. 加载commitlog
 
+`org.apache.rocketmq.store.CommitLog#load`
 
+> 3. 加载消费队列Consume Queue
 
+`org.apache.rocketmq.store.DefaultMessageStore#loadConsumeQueue`
 
+> 4. 加载存储checkpoint文件
 
+记录`CommitLog`文件、`ConsumeQueue`文件、`Index`文件的刷盘点。
 
+> 5. 加载Index文件
 
+如果上次异常退出，而且Index文件刷盘时间小于该文件最大的消息时间戳，则该文件将立即销毁。
+
+> 6. recover
+
+根据Broker是否为正常停止，执行不同的恢复策略，下文将分别介绍异常停止、正常停止的文件恢复机制。
+
+`org.apache.rocketmq.store.DefaultMessageStore#recover`
+
+> 7. 加载延迟队列
 
 
 
