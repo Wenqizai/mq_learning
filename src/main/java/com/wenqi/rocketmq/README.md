@@ -1236,19 +1236,24 @@ checkpoint用来记录commitlog，consumeQueue，Index文件刷盘时间点。
 
 #### 页缓存
 
-RocketMQ引用内存映射，将磁盘文件加载到内存中，极大提升文件的读写性能。
+`RocketMQ`引用内存映射，将磁盘文件加载到内存中，极大提升文件的读写性能。
+
+因为`RocketMQ`操作`CommitLog`、`ConsumeQueue`文件是基于内存映射机制并在启动的时候会加载`commitlog`、`consumequeue`目录下的所有文件，所以为了避免内存与磁盘的浪费，不可能将消息永久存储在消息服务器上，这就需要引入一种机制来删除已过期的文件。(删除任务：`org.apache.rocketmq.store.DefaultMessageStore#addScheduleTask`)
+
+```java
+// 指定删除文件时间点到了
+boolean timeup = this.isTimeToDelete();
+// 磁盘空间满了
+boolean spacefull = this.isSpaceToDelete();
+// 预留手工触发机制（暂未实现）
+boolean manualDelete = this.manualDeleteFileSeveralTimes > 0;
+```
+
+
 
 #### 刷盘
 
-> 同步刷盘
-
-
-
-
-
-> 异步刷盘
-
-默认方式
+![](https://klutzoder-blog.oss-cn-beijing.aliyuncs.com/2020/03/yi-bu-shua-pan-liu-cheng.png?x-oss-process=image/auto-orient,1/quality,q_90/watermark,text_a2x1dHpvZGVy,color_0c0c0c,size_20,g_se,x_10,y_10)
 
 
 # 思考点
