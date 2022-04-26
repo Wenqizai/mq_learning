@@ -6,6 +6,12 @@ Apache中文文档：https://www.itmuch.com/books/rocketmq/RocketMQ_Example.html
 
 控制台查询消息：https://help.aliyun.com/document_detail/29540.html
 
+- 一些博客
+
+Klutzoder'Blog：https://www.klutzoder.com/RocketMQ/middleware/rocketmq-03/
+
+
+
 ![MQ对比](https://images2017.cnblogs.com/blog/178437/201711/178437-20171116111559109-292574107.png)
 
 # 概念
@@ -453,11 +459,11 @@ public ConsumeConcurrentlyStatus consumeMessage(List<MessageExt> msgs, ConsumeCo
 
 # 源码
 
-### 问题点（待解决）
+## 问题点（待解决）
 
 1. 消息发送时的负载均衡，多个broker，每个broker都要建Topic？
 
-### NameServer
+## NameServer
 
 > 关注点
 
@@ -620,7 +626,7 @@ scanNotActiveBroker每10秒执行一次，而unregisterBroker 与 registerBroker
 
 org.apache.rocketmq.namesrv.processor.DefaultRequestProcessor#getRouteInfoByTopic
 
-### Producer
+## Producer
 
 图解RocketMQ消息发送和存储流程：https://cloud.tencent.com/developer/article/1717385
 
@@ -1060,7 +1066,7 @@ public interface LatencyFaultTolerance<T> {
 
 
 
-### Message
+## Message
 
 ![image-20220407144921030](../../../../resources/pic/message-struct.png)
 
@@ -1076,7 +1082,7 @@ public interface LatencyFaultTolerance<T> {
 
 
 
-### Broker
+## Broker
 
 处理发送信息请求：`org.apache.rocketmq.broker.processor.SendMessageProcessor#preSend`
 
@@ -1088,7 +1094,7 @@ public interface LatencyFaultTolerance<T> {
 
 `org.apache.rocketmq.broker.topic.TopicConfigManager#TopicConfigManager(org.apache.rocketmq.broker.BrokerController)`
 
-### 消息存储
+## 消息存储
 
 ![消息处理流程](../../../../resources/pic/msg-handle.png)
 
@@ -1255,6 +1261,21 @@ boolean manualDelete = this.manualDeleteFileSeveralTimes > 0;
 
 ![](https://klutzoder-blog.oss-cn-beijing.aliyuncs.com/2020/03/yi-bu-shua-pan-liu-cheng.png?x-oss-process=image/auto-orient,1/quality,q_90/watermark,text_a2x1dHpvZGVy,color_0c0c0c,size_20,g_se,x_10,y_10)
 
+## Consumer
+
+- 消费者拉取消息模式
+
+![consumer-pull-msg](../../../../resources/pic/consumer-pull-msg.png)
+
+- 消费进度反馈机制
+
+![消费进度反馈机制](../../../../resources/pic/消费进度反馈机制.png)
+
+> 关于消费进度提交机制的思考?
+
+线程`t1`，`t2`，`t3`同时消费消息`msg1`，`msg2`，`msg3`。假设线程`t3`先于`t1`、`t2`完成处理，那么`t3`在提交消费偏移量时是提交`msg3`的偏移量吗？
+
+如果提交`msg3`的偏移量是作为消费进度被提交，如果此时**消费端重启**，消息消费`msg1`、`msg2`就不会再被消费，这样就会造成“消息丢失”。因此`t3`线程并不会提交`msg3`的偏移量，而是**提交线程池中偏移量最小的消息的偏移量**，即`t3`线程在消费完`msg3`后，提交的消息消费进度依然是`msg1`的偏移量，这样能避免消息丢失，但同样有**消息重复消费的风险。**
 
 # 思考点
 
@@ -1455,15 +1476,19 @@ public void updateTopicRouteInfoFromNameServer() {
 
 ### RocketMQ性能改良
 
-1、 commitlog，consumequeue和index文件顺序写，consumequeue通过索引访问，条目固定大小，可通过逻辑偏移量访问。
+1.  `commitlog`，`consumequeue`和`index`文件长度固定以便使用内存映射机制进行文件的读写操作。
+2. 文件以文件的起始**偏移量**来命令文件，这样根据偏移量能快速定位到真实的物理文件。
+3. **基于内存映射文件机制**提供了**同步刷盘和异步刷盘两种机制**，异步刷盘是指在消息存储时先追加到内存映射文件，然后启动专门的刷盘线程定时将内存中的文件数据刷写到磁盘。
+4. `commitlog`单一文件存储所有主题消息，并且文件顺序写，提高吞吐量，方便文件读取。
+5. 构建消息消费队列文件`consumequeue`，实现了Hash索引，可以为消息设置索引键，根据所以能够快速从`CommitLog`文件中检索消息。
 
-2、 页缓存的引入(内存映射文件)
+> `RocketMQ`不会永久存储消息文件、消息消费队列文件，而是启动文件过期机制并在磁盘空间不足或者默认凌晨4点删除过期文件，文件保存72小时并且在删除文件时并不会判断该消息文件上的消息是否被消费。
 
 ### 宕机后的数据恢复
 
 `RocketMQ`是将消息全量存储在`CommitLog`文件中，并异步生成转发任务更新`ConsumeQueue`文件、Index文件。如果消息成功存储到`CommitLog`文件中，转发任务未成功执行，此时消息服务器Broker由于某个原因宕机，就会导致文件、`ConsumeQueue`文件、`Index`文件中的数据不一致。如果不加以人工修复，会有一部分消息即便在`CommitLog`文件中存在，由于并没有转发到`ConsumeQueue`文件，也永远不会被消费者消费。
 
-存储启动时所谓的文件恢复主要完成`flushedPosition`、`committedWhere`指针的设置、将消息消费队列最大偏移量加载到内存，并删除`flushedPosition`之后所有的文件。如果Broker异常停止，在文件恢复过程中，~会将最后一个有效文件中的所有消息重新转发到`ConsumeQueue`和`Index`文件中，确保不丢失消息，但同时会带来消息重复的问题。纵观`RocktMQ`的整体设计思想，`RocketMQ`保证消息不丢失但不保证消息不会重复消费，故消息消费业务方需要实现消息消费的幂等设计。
+存储启动时所谓的文件恢复主要完成`flushedPosition`、`committedWhere`指针的设置、将消息消费队列最大偏移量加载到内存，并删除`flushedPosition`之后所有的文件。如果Broker异常停止，在文件恢复过程中，会将最后一个有效文件中的所有消息重新转发到`ConsumeQueue`和`Index`文件中，确保不丢失消息，但同时会带来消息重复的问题。纵观`RocktMQ`的整体设计思想，`RocketMQ`保证消息不丢失但不保证消息不会重复消费，故消息消费业务方需要实现消息消费的幂等设计。
 
 `org.apache.rocketmq.store.DefaultMessageStore#load`
 
