@@ -1277,6 +1277,119 @@ boolean manualDelete = this.manualDeleteFileSeveralTimes > 0;
 
 如果提交`msg3`的偏移量是作为消费进度被提交，如果此时**消费端重启**，消息消费`msg1`、`msg2`就不会再被消费，这样就会造成“消息丢失”。因此`t3`线程并不会提交`msg3`的偏移量，而是**提交线程池中偏移量最小的消息的偏移量**，即`t3`线程在消费完`msg3`后，提交的消息消费进度依然是`msg1`的偏移量，这样能避免消息丢失，但同样有**消息重复消费的风险。**
 
+#### 1. 启动流程
+
+`org.apache.rocketmq.client.impl.consumer.DefaultMQPushConsumerImpl#start`
+
+1. 第一步：构建主题订阅信息`SubscriptionData`并加入`RebalanceImpl`的订阅消息中
+
+   - 通过调用`DefaultMQPushConsumerImpl#subscribe（Stringtopic, String subExpression）`方法获取
+
+   - 订阅重试主题消息
+
+```java
+ case CLUSTERING:
+    final String retryTopic = MixAll.getRetryTopic(this.defaultMQPushConsumer.getConsumerGroup());
+    SubscriptionData subscriptionData = FilterAPI.buildSubscriptionData(this.defaultMQPushConsumer.getConsumerGroup(),                                                                        retryTopic, SubscriptionData.SUB_ALL);
+    this.rebalanceImpl.getSubscriptionInner().put(retryTopic, subscriptionData);
+    break;
+```
+
+2. 初始化`MQClientInstance`、`RebalanceImple`（消息重新负载实现类）等
+
+```java
+this.mQClientFactory = MQClientManager.getInstance().getAndCreateMQClientInstance(this.defaultMQPushConsumer, this.rpcHook);
+this.rebalanceImpl.setConsumerGroup(this.defaultMQPushConsumer.getConsumerGroup());
+this.rebalanceImpl.setMessageModel(this.defaultMQPushConsumer.getMessageModel());
+this.rebalanceImpl.setAllocateMessageQueueStrategy(this.defaultMQPushConsumer.getAllocateMessageQueueStrategy());
+this.rebalanceImpl.setmQClientFactory(this.mQClientFactory);
+```
+
+3. 初始化消息进度。如果消息消费采用集群模式，那么消息进度存储在Broker上，如果采用广播模式，那么消息消费进度存储在消费端。
+
+```java
+ if (this.defaultMQPushConsumer.getOffsetStore() != null) {
+     this.offsetStore = this.defaultMQPushConsumer.getOffsetStore();
+ } else {
+     switch (this.defaultMQPushConsumer.getMessageModel()) {
+         case BROADCASTING:
+             this.offsetStore = new LocalFileOffsetStore(this.mQClientFactory, this.defaultMQPushConsumer.getConsumerGroup());
+             break;
+         case CLUSTERING:
+             this.offsetStore = new RemoteBrokerOffsetStore(this.mQClientFactory, this.defaultMQPushConsumer.getConsumerGroup());
+             break;
+         default:
+             break;
+     }
+     this.defaultMQPushConsumer.setOffsetStore(this.offsetStore);
+ }
+this.offsetStore.load();
+```
+
+4. 创建消费端消费线程服务。`ConsumeMessageService`主要负责消息消费，在内部维护一个线程池
+
+```java
+if (this.getMessageListenerInner() instanceof MessageListenerOrderly) {
+    this.consumeOrderly = true;
+    this.consumeMessageService =
+        new ConsumeMessageOrderlyService(this, (MessageListenerOrderly) this.getMessageListenerInner());
+} else if (this.getMessageListenerInner() instanceof MessageListenerConcurrently) {
+    this.consumeOrderly = false;
+    this.consumeMessageService =
+        new ConsumeMessageConcurrentlyService(this, (MessageListenerConcurrently) this.getMessageListenerInner());
+}
+```
+
+5. 向`MQClientInstance`注册消费者并启动`MQClientInstance`，`JVM`中的所有消费者、生产者持有同一个`MQClientInstance`，`MQClientInstance`只会启动一次。
+
+#### 2. 消息拉取
+
+`MQClientInstance#start`启动过程中，会使用一个单独的线程`pullMessageService`进行消息的拉取。
+
+因此，`PullMessageService`只有在得到`PullRequest`对象时才会执行拉取任务，`PullRequest`的生成地方共有2处：
+
+1. 一个是在`RocketMQ`根据`PullRequest`拉取任务执行完一次消息拉取任务后，又将`PullRequest`对象放入`pullRequestQueue`；
+2. 另一个是在`RebalanceImpl`中创建的。
+
+```java
+public void run() {
+    log.info(this.getServiceName() + " service started");
+
+    while (!this.isStopped()) {
+        try {
+            PullRequest pullRequest = this.pullRequestQueue.take();
+            // 这里会将pullRequest重新放入pullRequestQueue中，重新执行消息拉取任务
+            this.pullMessage(pullRequest);
+        } catch (InterruptedException ignored) {
+        } catch (Exception e) {
+            log.error("Pull Message Service Run Method exception", e);
+        }
+    }
+
+    log.info(this.getServiceName() + " service end");
+}
+```
+
+> 拉取流程
+
+1. 客户端封装消息拉取请求
+
+`org.apache.rocketmq.client.impl.consumer.DefaultMQPushConsumerImpl#pullMessage`
+
+2. 消息服务器查找消息并返回
+
+`org.apache.rocketmq.broker.processor.PullMessageProcessor#processRequest(io.netty.channel.ChannelHandlerContext, org.apache.rocketmq.remoting.protocol.RemotingCommand)`
+
+3. 消息拉取客户端处理返回的消息
+
+`org.apache.rocketmq.client.impl.MQClientAPIImpl#pullMessageAsync`
+
+`DefaultMQPushConsumerImpl$PullCallBack#onSuccess`
+
+#### 3. 消息消费
+
+`org.apache.rocketmq.client.impl.consumer.ConsumeMessageService#submitConsumeRequest`
+
 # 思考点
 
 ### 生产环境下 RocketMQ 为什么不能开启自动创建主题？
@@ -1520,9 +1633,175 @@ public void updateTopicRouteInfoFromNameServer() {
 
 > 7. 加载延迟队列
 
+### 流量控制8大场景
+
+参看文档：https://heapdump.cn/article/3712290，https://cloud.tencent.com/developer/article/1456404
+
+- Broker(Producer)
+
+`org.apache.rocketmq.broker.latency.BrokerFastFailure#start`
+
+默认情况下，broker开启流控开关：`brokerFastFailureEnable = true`，broker每隔10毫秒会做一次流控处理。处理方式：从队列中获取一个请求，设置响应码`RemotingSysResponseCode.SYSTEM_BUSY`，返回给Producer。注意Producer不会对此响应码做消息重试。
+
+```java
+// page busy 流控处理
+if (!this.brokerController.getSendThreadPoolQueue().isEmpty()) {
+     // 此处为poll， 
+     final Runnable runnable = this.brokerController.getSendThreadPoolQueue().poll(0, TimeUnit.SECONDS);
+     if (null == runnable) {
+         break;
+     }
+
+     final RequestTask rt = castRunnable(runnable);
+     rt.returnResponse(RemotingSysResponseCode.SYSTEM_BUSY, String.format("[PCBUSY_CLEAN_QUEUE]broker busy, start flow control for a while, period in queue: %sms, size of queue: %d", System.currentTimeMillis() - rt.getCreateTimestamp(), this.brokerController.getSendThreadPoolQueue().size()));
+ } else {
+     break;
+ }
+
+// 
+if (!blockingQueue.isEmpty()) {
+    final Runnable runnable = blockingQueue.peek();
+    if (null == runnable) {
+        break;
+    }
+    final RequestTask rt = castRunnable(runnable);
+    if (rt == null || rt.isStopRun()) {
+        break;
+    }
+
+    final long behind = System.currentTimeMillis() - rt.getCreateTimestamp();
+    if (behind >= maxWaitTimeMillsInQueue) {
+        if (blockingQueue.remove(runnable)) {
+            rt.setStopRun(true);
+            rt.returnResponse(RemotingSysResponseCode.SYSTEM_BUSY, String.format("[TIMEOUT_CLEAN_QUEUE]broker busy, start flow control for a while, period in queue: %sms, size of queue: %d", behind, blockingQueue.size()));
+        }
+    } else {
+        break;
+    }
+} else {
+    break;
+}
+```
 
 
 
 
 
+判断方式如下：
+
+> `BrokerFastFailure`
+
+1. Page Cache 繁忙
+   - 获取 `CommitLog` 写入锁，如果持有锁的时间大于 `osPageCacheBusyTimeOutMills`（默认 `1s`）
+2. 清理过期请求
+
+清理过期请求时，如果请求线程的创建时间到当前系统时间间隔大于 `waitTimeMillsInSendQueue`（默认 200 ms，可以配置）就会清理这个请求。
+
+> `NettyRemotingAbstract`
+
+1. system busy
+
+`NettyRemotingAbstract#processRequestCommand`
+
+```java
+// 拒绝请求
+if (pair.getObject1().rejectRequest()) {
+    final RemotingCommand response = RemotingCommand.createResponseCommand(RemotingSysResponseCode.SYSTEM_BUSY,
+                                                                           "[REJECTREQUEST]system busy, start flow control for a while");
+    response.setOpaque(opaque);
+    ctx.writeAndFlush(response);
+    return;
+}
+// 两种情况：1. page cache繁忙 2. 开启TransientStorePoolDeficient，堆外的buffer=0没有空闲
+public boolean rejectRequest() {
+    return this.brokerController.getMessageStore().isOSPageCacheBusy() ||
+        this.brokerController.getMessageStore().isTransientStorePoolDeficient();
+}
+```
+
+2. 线程池拒绝
+
+Broker 收到请求后，会把处理逻辑封装成到 Runnable 中，由线程池来提交执行，如果线程池满了就会拒绝请求（这里线程池中队列的大小默认是 10000，可以通过参数 `sendThreadPoolQueueCapacity` 进行配置），线程池拒绝后会抛出异常 `RejectedExecutionException`，程序捕获到异常后，会判断是不是单向请求（`OnewayRPC`），如果不是，就会给 Producer 返回一个系统繁忙的状态码（code=2，remark="[OVERLOAD]system busy, start flow control for a while"）
+
+- Consumer
+
+`org.apache.rocketmq.client.impl.consumer.DefaultMQPushConsumerImpl#pullMessage`
+
+消费者在拉取消息时会检查流控要求，若超过预设的阈值，将会触发消息流控，放弃本次消息拉取并且该队列的下一次拉取任务将在50 ms后才加入拉取任务队列。
+
+1. 缓存消息数量超过阈值和缓存消息大小超过阈值(`cachedMessageCount`, `cachedMessageSizeInMiB`)
+
+```java
+long cachedMessageCount = processQueue.getMsgCount().get();
+long cachedMessageSizeInMiB = processQueue.getMsgSize().get() / (1024 * 1024);
+
+if (cachedMessageCount > this.defaultMQPushConsumer.getPullThresholdForQueue()) {
+    this.executePullRequestLater(pullRequest, PULL_TIME_DELAY_MILLS_WHEN_FLOW_CONTROL);
+    if ((queueFlowControlTimes++ % 1000) == 0) {
+        log.warn(
+            "the cached message count exceeds the threshold {}, so do flow control, minOffset={}, maxOffset={}, count={}, size={} MiB, pullRequest={}, flowControlTimes={}",
+            this.defaultMQPushConsumer.getPullThresholdForQueue(), processQueue.getMsgTreeMap().firstKey(), processQueue.getMsgTreeMap().lastKey(), cachedMessageCount, cachedMessageSizeInMiB, pullRequest, queueFlowControlTimes);
+    }
+    return;
+}
+
+if (cachedMessageSizeInMiB > this.defaultMQPushConsumer.getPullThresholdSizeForQueue()) {
+    this.executePullRequestLater(pullRequest, PULL_TIME_DELAY_MILLS_WHEN_FLOW_CONTROL);
+    if ((queueFlowControlTimes++ % 1000) == 0) {
+        log.warn(
+            "the cached message size exceeds the threshold {} MiB, so do flow control, minOffset={}, maxOffset={}, count={}, size={} MiB, pullRequest={}, flowControlTimes={}",
+            this.defaultMQPushConsumer.getPullThresholdSizeForQueue(), processQueue.getMsgTreeMap().firstKey(), processQueue.getMsgTreeMap().lastKey(), cachedMessageCount, cachedMessageSizeInMiB, pullRequest, queueFlowControlTimes);
+    }
+    return;
+}
+```
+
+2. 并发消费：`ProcessQueue`中队列最大偏移量与最小偏离量的间距不能超过`consumeConcurrently MaxSpan`，否则触发流控。这里主要的考量是担心因为一条消息堵塞，使消息进度无法向前推进，可能会造成大量消息重复消费。
+
+```java
+if (!this.consumeOrderly) {
+    if (processQueue.getMaxSpan() > this.defaultMQPushConsumer.getConsumeConcurrentlyMaxSpan()) {
+        this.executePullRequestLater(pullRequest, PULL_TIME_DELAY_MILLS_WHEN_FLOW_CONTROL);
+        if ((queueMaxSpanFlowControlTimes++ % 1000) == 0) {
+            log.warn(
+                "the queue's messages, span too long, so do flow control, minOffset={}, maxOffset={}, maxSpan={}, pullRequest={}, flowControlTimes={}",
+                processQueue.getMsgTreeMap().firstKey(), processQueue.getMsgTreeMap().lastKey(), processQueue.getMaxSpan(),
+                pullRequest, queueMaxSpanFlowControlTimes);
+        }
+        return;
+    }
+}
+```
+
+3. 顺序消费
+
+对于顺序消费的情况，`ProcessQueue` 加锁失败，也会延迟拉取，这个延迟时间默认是 3 s，可以配置。
+
+```java
+ if (processQueue.isLocked()) {
+     if (!pullRequest.isLockedFirst()) {
+         final long offset = this.rebalanceImpl.computePullFromWhere(pullRequest.getMessageQueue());
+         boolean brokerBusy = offset < pullRequest.getNextOffset();
+         log.info("the first time to pull message, so fix offset from broker. pullRequest: {} NewOffset: {} brokerBusy: {}",
+                  pullRequest, offset, brokerBusy);
+         if (brokerBusy) {
+             log.info("[NOTIFYME]the first time to pull message, but pull request offset larger than broker consume offset. pullRequest: {} NewOffset: {}",
+                      pullRequest, offset);
+         }
+
+         pullRequest.setLockedFirst(true);
+         pullRequest.setNextOffset(offset);
+     }
+ } else {
+     this.executePullRequestLater(pullRequest, PULL_TIME_DELAY_MILLS_WHEN_EXCEPTION);
+     log.info("pull message later because not locked in broker, {}", pullRequest);
+     return;
+ }
+```
+
+- 总结	
+
+`RocketMQ` 发生流量控制的 8 个场景，其中 Broker 4 个场景，Consumer 4 个场景。Broker 的流量控制，本质是对 Producer 的流量控制，最好的解决方法就是给 Broker 扩容，增加 Broker 写入能力。而对于 Consumer 端的流量控制，需要解决 Consumer 端消费慢的问题，比如有第三方接口响应慢或者有慢 SQL。
+
+在使用的时候，根据打印的日志可以分析具体是哪种情况的流量控制，并采用相应的措施。
 
