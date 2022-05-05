@@ -1388,7 +1388,54 @@ public void run() {
 
 #### 3. 消息消费
 
+- 拉取消息并提交到消费者线程池
+
 `org.apache.rocketmq.client.impl.consumer.ConsumeMessageService#submitConsumeRequest`
+
+```java
+ public void submitConsumeRequest(final List<MessageExt> msgs, final ProcessQueue processQueue, final MessageQueue messageQueue, final boolean dispatchToConsume) {
+     final int consumeBatchSize = this.defaultMQPushConsumer.getConsumeMessageBatchMaxSize();
+     if (msgs.size() <= consumeBatchSize) {
+         ConsumeRequest consumeRequest = new ConsumeRequest(msgs, processQueue, messageQueue);
+         try {
+             // 将consumeRequest提交到消息消费者线程池处理
+             this.consumeExecutor.submit(consumeRequest);
+         } catch (RejectedExecutionException e) {
+             // 拒绝任务的标准处理方式: 延时重新提交
+             this.submitConsumeRequestLater(consumeRequest);
+         }
+     } else {
+         for (int total = 0; total < msgs.size(); ) {
+             // 分批提交消费者线程池
+             List<MessageExt> msgThis = new ArrayList<MessageExt>(consumeBatchSize);
+             for (int i = 0; i < consumeBatchSize; i++, total++) {
+                 if (total < msgs.size()) {
+                     msgThis.add(msgs.get(total));
+                 } else {
+                     break;
+                 }
+             }
+
+             ConsumeRequest consumeRequest = new ConsumeRequest(msgThis, processQueue, messageQueue);
+             try {
+                 this.consumeExecutor.submit(consumeRequest);
+             } catch (RejectedExecutionException e) {
+                 for (; total < msgs.size(); total++) {
+                     msgThis.add(msgs.get(total));
+                 }
+
+                 this.submitConsumeRequestLater(consumeRequest);
+             }
+         }
+     }
+ }
+```
+
+- 消费者线程池处理消息
+
+`org.apache.rocketmq.client.impl.consumer.ConsumeMessageConcurrentlyService.ConsumeRequest#run`
+
+
 
 # 思考点
 
