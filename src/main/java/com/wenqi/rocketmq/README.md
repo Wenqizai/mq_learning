@@ -1281,21 +1281,28 @@ boolean manualDelete = this.manualDeleteFileSeveralTimes > 0;
 
 `org.apache.rocketmq.client.impl.consumer.DefaultMQPushConsumerImpl#start`
 
-1. 第一步：构建主题订阅信息`SubscriptionData`并加入`RebalanceImpl`的订阅消息中
+第一步：构建主题订阅信息`SubscriptionData`并加入`RebalanceImpl`的订阅消息中，订阅信息的来源主要是以下两个方面。（`org.apache.rocketmq.client.impl.consumer.DefaultMQPushConsumerImpl#copySubscription`）
 
-   - 通过调用`DefaultMQPushConsumerImpl#subscribe（Stringtopic, String subExpression）`方法获取
-
-   - 订阅重试主题消息
+- 通过调用`DefaultMQPushConsumerImpl#subscribe（Stringtopic, String subExpression）`方法获取(此方法在构建Consumer时调用)
 
 ```java
- case CLUSTERING:
+// 实例化消费者
+DefaultMQPushConsumer consumer = new DefaultMQPushConsumer("consumer_group_demo_01");
+// 订阅一个或者多个Topic, 以及Tag来过滤需要消费的消息
+consumer.subscribe("TopicTest", "*");
+```
+
+- 订阅重试主题消息(此方法只会在集群模式下调用)
+
+```java
+case CLUSTERING:
     final String retryTopic = MixAll.getRetryTopic(this.defaultMQPushConsumer.getConsumerGroup());
     SubscriptionData subscriptionData = FilterAPI.buildSubscriptionData(this.defaultMQPushConsumer.getConsumerGroup(),                                                                        retryTopic, SubscriptionData.SUB_ALL);
     this.rebalanceImpl.getSubscriptionInner().put(retryTopic, subscriptionData);
     break;
 ```
 
-2. 初始化`MQClientInstance`、`RebalanceImple`（消息重新负载实现类）等
+第二步：初始化`MQClientInstance`、`RebalanceImple`（消息重新负载实现类）等
 
 ```java
 this.mQClientFactory = MQClientManager.getInstance().getAndCreateMQClientInstance(this.defaultMQPushConsumer, this.rpcHook);
@@ -1305,7 +1312,7 @@ this.rebalanceImpl.setAllocateMessageQueueStrategy(this.defaultMQPushConsumer.ge
 this.rebalanceImpl.setmQClientFactory(this.mQClientFactory);
 ```
 
-3. 初始化消息进度。如果消息消费采用集群模式，那么消息进度存储在Broker上，如果采用广播模式，那么消息消费进度存储在消费端。
+第三步：初始化消息进度。如果消息消费采用集群模式，那么消息进度存储在Broker上，如果采用广播模式，那么消息消费进度存储在消费端。
 
 ```java
  if (this.defaultMQPushConsumer.getOffsetStore() != null) {
@@ -1313,9 +1320,11 @@ this.rebalanceImpl.setmQClientFactory(this.mQClientFactory);
  } else {
      switch (this.defaultMQPushConsumer.getMessageModel()) {
          case BROADCASTING:
+             // 广播模式， 消息进度放在本地，即consumer端
              this.offsetStore = new LocalFileOffsetStore(this.mQClientFactory, this.defaultMQPushConsumer.getConsumerGroup());
              break;
          case CLUSTERING:
+         		 // 集群模式，消息进度放在Broker
              this.offsetStore = new RemoteBrokerOffsetStore(this.mQClientFactory, this.defaultMQPushConsumer.getConsumerGroup());
              break;
          default:
@@ -1326,21 +1335,37 @@ this.rebalanceImpl.setmQClientFactory(this.mQClientFactory);
 this.offsetStore.load();
 ```
 
-4. 创建消费端消费线程服务。`ConsumeMessageService`主要负责消息消费，在内部维护一个线程池
+第四步：创建消费端消费线程服务。`ConsumeMessageService`主要负责消息消费，在内部维护一个线程池
 
 ```java
 if (this.getMessageListenerInner() instanceof MessageListenerOrderly) {
+    // 顺序消费
     this.consumeOrderly = true;
     this.consumeMessageService =
         new ConsumeMessageOrderlyService(this, (MessageListenerOrderly) this.getMessageListenerInner());
 } else if (this.getMessageListenerInner() instanceof MessageListenerConcurrently) {
+    // 非顺序消费，并发消费
     this.consumeOrderly = false;
     this.consumeMessageService =
         new ConsumeMessageConcurrentlyService(this, (MessageListenerConcurrently) this.getMessageListenerInner());
 }
+// 启动消费线程池
+this.consumeMessageService.start();
 ```
 
-5. 向`MQClientInstance`注册消费者并启动`MQClientInstance`，`JVM`中的所有消费者、生产者持有同一个`MQClientInstance`，`MQClientInstance`只会启动一次。
+第五步：向`MQClientInstance`注册消费者并启动`MQClientInstance`，`JVM`中的所有消费者、生产者持有同一个`MQClientInstance`，`MQClientInstance`只会启动一次。
+
+```java
+// mQClientFactory即MQClientInstance，只启动一次，并只有一个
+boolean registerOK = mQClientFactory.registerConsumer(this.defaultMQPushConsumer.getConsumerGroup(), this);
+if (!registerOK) {
+  this.serviceState = ServiceState.CREATE_JUST;
+  this.consumeMessageService.shutdown(defaultMQPushConsumer.getAwaitTerminationMillisWhenShutdown());
+  throw new MQClientException("The consumer group[" + this.defaultMQPushConsumer.getConsumerGroup()
+                              + "] has been created before, specify another name please." + FAQUrl.suggestTodo(FAQUrl.GROUP_NAME_DUPLICATE_URL),
+                              null);
+}
+```
 
 #### 2. 消息拉取
 
