@@ -626,6 +626,45 @@ scanNotActiveBroker每10秒执行一次，而unregisterBroker 与 registerBroker
 
 org.apache.rocketmq.namesrv.processor.DefaultRequestProcessor#getRouteInfoByTopic
 
+## MQClientInstance
+
+`JVM`中的所有消费者、生产者持有同一个`MQClientInstance`，`MQClientInstance`只会启动一次。
+
+- 启动：`org.apache.rocketmq.client.impl.factory.MQClientInstance#start`
+
+```java
+// MQClientInstance启动方法
+public void start() throws MQClientException {
+  synchronized (this) {
+    switch (this.serviceState) {
+      case CREATE_JUST:
+        this.serviceState = ServiceState.START_FAILED;
+        // If not specified,looking address from name server
+        if (null == this.clientConfig.getNamesrvAddr()) {
+          this.mQClientAPIImpl.fetchNameServerAddr();
+        }
+        // Start request-response channel
+        this.mQClientAPIImpl.start();
+        // Start various schedule tasks
+        this.startScheduledTask();
+        // Start pull service (启动拉起消息线程)
+        this.pullMessageService.start();
+        // Start rebalance service
+        this.rebalanceService.start();
+        // Start push service
+        this.defaultMQProducer.getDefaultMQProducerImpl().start(false);
+        log.info("the client factory [{}] start OK", this.clientId);
+        this.serviceState = ServiceState.RUNNING;
+        break;
+      case START_FAILED:
+        throw new MQClientException("The Factory object[" + this.getClientId() + "] has been created before, and failed.", null);
+      default:
+        break;
+    }
+  }
+}
+```
+
 ## Producer
 
 图解RocketMQ消息发送和存储流程：https://cloud.tencent.com/developer/article/1717385
@@ -1371,7 +1410,40 @@ if (!registerOK) {
 
 `MQClientInstance#start`启动过程中，会使用一个单独的线程`pullMessageService`进行消息的拉取。
 
-因此，`PullMessageService`只有在得到`PullRequest`对象时才会执行拉取任务，`PullRequest`的生成地方共有2处：
+```java
+// MQClientInstance启动方法
+public void start() throws MQClientException {
+  synchronized (this) {
+    switch (this.serviceState) {
+      case CREATE_JUST:
+        this.serviceState = ServiceState.START_FAILED;
+        // If not specified,looking address from name server
+        if (null == this.clientConfig.getNamesrvAddr()) {
+          this.mQClientAPIImpl.fetchNameServerAddr();
+        }
+        // Start request-response channel
+        this.mQClientAPIImpl.start();
+        // Start various schedule tasks
+        this.startScheduledTask();
+        // Start pull service (启动拉起消息线程)
+        this.pullMessageService.start();
+        // Start rebalance service
+        this.rebalanceService.start();
+        // Start push service
+        this.defaultMQProducer.getDefaultMQProducerImpl().start(false);
+        log.info("the client factory [{}] start OK", this.clientId);
+        this.serviceState = ServiceState.RUNNING;
+        break;
+      case START_FAILED:
+        throw new MQClientException("The Factory object[" + this.getClientId() + "] has been created before, and failed.", null);
+      default:
+        break;
+    }
+  }
+}
+```
+
+`PullMessageService`只有在得到`PullRequest`对象时才会执行拉取任务，`PullRequest`的生成地方共有2处：
 
 1. 一个是在`RocketMQ`根据`PullRequest`拉取任务执行完一次消息拉取任务后，又将`PullRequest`对象放入`pullRequestQueue`；
 2. 另一个是在`RebalanceImpl`中创建的。
@@ -1379,9 +1451,10 @@ if (!registerOK) {
 ```java
 public void run() {
     log.info(this.getServiceName() + " service started");
-
+		// Stopped声明为volatile，停止正在运行线程的设计技巧
     while (!this.isStopped()) {
         try {
+            // pullRequest为空，则获取阻塞
             PullRequest pullRequest = this.pullRequestQueue.take();
             // 这里会将pullRequest重新放入pullRequestQueue中，重新执行消息拉取任务
             this.pullMessage(pullRequest);
@@ -1392,6 +1465,23 @@ public void run() {
     }
 
     log.info(this.getServiceName() + " service end");
+}
+```
+
+- `PullRequest`组成
+
+```java
+public class PullRequest {
+  // 消费者组
+  private String consumerGroup;
+  // 待拉取消费队列（负载均衡）
+  private MessageQueue messageQueue;
+  // 消息处理队列，从Broker中拉取到的消息会先存入ProccessQueue，然后再提交到消费者消费线程池进行消费。
+  private ProcessQueue processQueue;
+  // 待拉取的MessageQueue偏移量
+  private long nextOffset;
+  // 是否被锁定
+  private boolean previouslyLocked = false;
 }
 ```
 
