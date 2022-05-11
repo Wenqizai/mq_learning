@@ -1485,11 +1485,15 @@ public class PullRequest {
 }
 ```
 
-> 拉取流程
+> 消息拉取基本流程
 
 1. 客户端封装消息拉取请求
 
 `org.apache.rocketmq.client.impl.consumer.DefaultMQPushConsumerImpl#pullMessage`
+
+这里会触发流控：主要的考量是担心因为一条消息堵塞，使消息进度无法向前推进，可能会造成大量消息重复消费。当触发流控时，会将`pullRequest`放到延迟队列中，延迟执行。
+
+真正执行拉取消息的操作：`org.apache.rocketmq.client.impl.consumer.PullAPIWrapper#pullKernelImpl`
 
 2. 消息服务器查找消息并返回
 
