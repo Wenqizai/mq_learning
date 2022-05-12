@@ -18,7 +18,7 @@ Klutzoder'Blog：https://www.klutzoder.com/RocketMQ/middleware/rocketmq-03/
 
 ### Topic
 
-第一级消息类型
+消息只能发送到同一个Topic中，同一个Topic可以分布到不同的Broker中，Broker中存储多个消费Queue。当进行消息发送时，消息客户端会拉取同一个Topic的所有Broker下所有的消费Queue进行负载均衡发送。
 
 ### Tag
 
@@ -37,6 +37,20 @@ Klutzoder'Blog：https://www.klutzoder.com/RocketMQ/middleware/rocketmq-03/
 `RocketMQ` 会创建专门的索引文件，用来存储 Key 与消息的映射，由于是 Hash 索引，应==务必保证key尽可能唯一，避免潜在的哈希冲突。==
 
 Tag 和 Key 的主要差别是使用场景不同，Tag 用在 Consumer 代码中，用于服务端消息过滤Key 主要用于通过命令进行查找消息。`RocketMQ` 并不能保证 message id 唯一，在这种情况下，生产者在 push 消息的时候可以给每条消息设定唯一的 key, 消费者可以通过 message key保证对消息幂等处理。
+
+### Producer Group
+
+生产者发送组主要用处是：若事务消息，如果某条发送某条消息的producer-A宕机，使得事务消息一直处于PREPARED状态并超时，则broker会回查同一个group的其他producer，确认这条消息应该commit还是rollback。
+
+### Consumer Group
+
+一个Group相当于一个订阅者，当消费模式是广播模式，消息会发送到所有的消费组中供消费（注意：不是所有消费者队列）；当消费模式是集群模式，消费会按照负载均衡策略，轮流发送消息到每个消费者组中（注意：消息只会发送到某一个Group）。
+
+不同的消费组是从ConsumeQueue中拉取消息，消费消息后会记录消费的最大offset，表示之前的消息都已经消费过了，这个offset是保存再消费者组中，不是ConsumeQueue中。ConsumeQueue被消费消息后只是标记为已读状态，并不会删除消息，未删除的消息可供其他消费组消费。
+
+这意味着，不同的group独自保存自己的消费offset，不同group的消费进度独立不相互影响。比如：a.  group 1发送积压，并不会影响到group 2的消费；b. group 1已经消费过了消息，group 2照样可以消费。
+
+consumer group最大作用于消费是集群模式，还是广播模式。
 
 # Quick Start
 

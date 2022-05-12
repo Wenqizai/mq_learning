@@ -4,6 +4,7 @@ import org.apache.rocketmq.client.consumer.DefaultMQPushConsumer;
 import org.apache.rocketmq.client.consumer.listener.ConsumeConcurrentlyStatus;
 import org.apache.rocketmq.client.consumer.listener.MessageListenerConcurrently;
 import org.apache.rocketmq.client.exception.MQClientException;
+import org.apache.rocketmq.common.protocol.heartbeat.MessageModel;
 
 /**
  * @author liangwenqi
@@ -19,6 +20,11 @@ public class Consumer {
 
         // 订阅一个或者多个Topic, 以及Tag来过滤需要消费的消息
         consumer.subscribe("TopicTest", "*");
+
+        // 设置广播模式
+        consumer.setMessageModel(MessageModel.BROADCASTING);
+        // 设置集群模式消费
+        consumer.setMessageModel(MessageModel.CLUSTERING);
 
         // 注册回调实现类来处理从broker拉取回来的消息
         consumer.registerMessageListener((MessageListenerConcurrently) (msgs, context) -> {
