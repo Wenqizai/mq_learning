@@ -640,6 +640,45 @@ scanNotActiveBroker每10秒执行一次，而unregisterBroker 与 registerBroker
 
 org.apache.rocketmq.namesrv.processor.DefaultRequestProcessor#getRouteInfoByTopic
 
+## MQClientInstance
+
+`JVM`中的所有消费者、生产者持有同一个`MQClientInstance`，`MQClientInstance`只会启动一次。
+
+- 启动：`org.apache.rocketmq.client.impl.factory.MQClientInstance#start`
+
+```java
+// MQClientInstance启动方法
+public void start() throws MQClientException {
+  synchronized (this) {
+    switch (this.serviceState) {
+      case CREATE_JUST:
+        this.serviceState = ServiceState.START_FAILED;
+        // If not specified,looking address from name server
+        if (null == this.clientConfig.getNamesrvAddr()) {
+          this.mQClientAPIImpl.fetchNameServerAddr();
+        }
+        // Start request-response channel
+        this.mQClientAPIImpl.start();
+        // Start various schedule tasks
+        this.startScheduledTask();
+        // Start pull service (启动拉起消息线程)
+        this.pullMessageService.start();
+        // Start rebalance service
+        this.rebalanceService.start();
+        // Start push service
+        this.defaultMQProducer.getDefaultMQProducerImpl().start(false);
+        log.info("the client factory [{}] start OK", this.clientId);
+        this.serviceState = ServiceState.RUNNING;
+        break;
+      case START_FAILED:
+        throw new MQClientException("The Factory object[" + this.getClientId() + "] has been created before, and failed.", null);
+      default:
+        break;
+    }
+  }
+}
+```
+
 ## Producer
 
 图解RocketMQ消息发送和存储流程：https://cloud.tencent.com/developer/article/1717385
@@ -1295,21 +1334,28 @@ boolean manualDelete = this.manualDeleteFileSeveralTimes > 0;
 
 `org.apache.rocketmq.client.impl.consumer.DefaultMQPushConsumerImpl#start`
 
-1. 第一步：构建主题订阅信息`SubscriptionData`并加入`RebalanceImpl`的订阅消息中
+第一步：构建主题订阅信息`SubscriptionData`并加入`RebalanceImpl`的订阅消息中，订阅信息的来源主要是以下两个方面。（`org.apache.rocketmq.client.impl.consumer.DefaultMQPushConsumerImpl#copySubscription`）
 
-   - 通过调用`DefaultMQPushConsumerImpl#subscribe（Stringtopic, String subExpression）`方法获取
-
-   - 订阅重试主题消息
+- 通过调用`DefaultMQPushConsumerImpl#subscribe（Stringtopic, String subExpression）`方法获取(此方法在构建Consumer时调用)
 
 ```java
- case CLUSTERING:
+// 实例化消费者
+DefaultMQPushConsumer consumer = new DefaultMQPushConsumer("consumer_group_demo_01");
+// 订阅一个或者多个Topic, 以及Tag来过滤需要消费的消息
+consumer.subscribe("TopicTest", "*");
+```
+
+- 订阅重试主题消息(此方法只会在集群模式下调用)
+
+```java
+case CLUSTERING:
     final String retryTopic = MixAll.getRetryTopic(this.defaultMQPushConsumer.getConsumerGroup());
     SubscriptionData subscriptionData = FilterAPI.buildSubscriptionData(this.defaultMQPushConsumer.getConsumerGroup(),                                                                        retryTopic, SubscriptionData.SUB_ALL);
     this.rebalanceImpl.getSubscriptionInner().put(retryTopic, subscriptionData);
     break;
 ```
 
-2. 初始化`MQClientInstance`、`RebalanceImple`（消息重新负载实现类）等
+第二步：初始化`MQClientInstance`、`RebalanceImple`（消息重新负载实现类）等
 
 ```java
 this.mQClientFactory = MQClientManager.getInstance().getAndCreateMQClientInstance(this.defaultMQPushConsumer, this.rpcHook);
@@ -1319,7 +1365,7 @@ this.rebalanceImpl.setAllocateMessageQueueStrategy(this.defaultMQPushConsumer.ge
 this.rebalanceImpl.setmQClientFactory(this.mQClientFactory);
 ```
 
-3. 初始化消息进度。如果消息消费采用集群模式，那么消息进度存储在Broker上，如果采用广播模式，那么消息消费进度存储在消费端。
+第三步：初始化消息进度。如果消息消费采用集群模式，那么消息进度存储在Broker上，如果采用广播模式，那么消息消费进度存储在消费端。
 
 ```java
  if (this.defaultMQPushConsumer.getOffsetStore() != null) {
@@ -1327,9 +1373,11 @@ this.rebalanceImpl.setmQClientFactory(this.mQClientFactory);
  } else {
      switch (this.defaultMQPushConsumer.getMessageModel()) {
          case BROADCASTING:
+             // 广播模式， 消息进度放在本地，即consumer端
              this.offsetStore = new LocalFileOffsetStore(this.mQClientFactory, this.defaultMQPushConsumer.getConsumerGroup());
              break;
          case CLUSTERING:
+         		 // 集群模式，消息进度放在Broker
              this.offsetStore = new RemoteBrokerOffsetStore(this.mQClientFactory, this.defaultMQPushConsumer.getConsumerGroup());
              break;
          default:
@@ -1340,27 +1388,76 @@ this.rebalanceImpl.setmQClientFactory(this.mQClientFactory);
 this.offsetStore.load();
 ```
 
-4. 创建消费端消费线程服务。`ConsumeMessageService`主要负责消息消费，在内部维护一个线程池
+第四步：创建消费端消费线程服务。`ConsumeMessageService`主要负责消息消费，在内部维护一个线程池
 
 ```java
 if (this.getMessageListenerInner() instanceof MessageListenerOrderly) {
+    // 顺序消费
     this.consumeOrderly = true;
     this.consumeMessageService =
         new ConsumeMessageOrderlyService(this, (MessageListenerOrderly) this.getMessageListenerInner());
 } else if (this.getMessageListenerInner() instanceof MessageListenerConcurrently) {
+    // 非顺序消费，并发消费
     this.consumeOrderly = false;
     this.consumeMessageService =
         new ConsumeMessageConcurrentlyService(this, (MessageListenerConcurrently) this.getMessageListenerInner());
 }
+// 启动消费线程池
+this.consumeMessageService.start();
 ```
 
-5. 向`MQClientInstance`注册消费者并启动`MQClientInstance`，`JVM`中的所有消费者、生产者持有同一个`MQClientInstance`，`MQClientInstance`只会启动一次。
+第五步：向`MQClientInstance`注册消费者并启动`MQClientInstance`，`JVM`中的所有消费者、生产者持有同一个`MQClientInstance`，`MQClientInstance`只会启动一次。
+
+```java
+// mQClientFactory即MQClientInstance，只启动一次，并只有一个
+boolean registerOK = mQClientFactory.registerConsumer(this.defaultMQPushConsumer.getConsumerGroup(), this);
+if (!registerOK) {
+  this.serviceState = ServiceState.CREATE_JUST;
+  this.consumeMessageService.shutdown(defaultMQPushConsumer.getAwaitTerminationMillisWhenShutdown());
+  throw new MQClientException("The consumer group[" + this.defaultMQPushConsumer.getConsumerGroup()
+                              + "] has been created before, specify another name please." + FAQUrl.suggestTodo(FAQUrl.GROUP_NAME_DUPLICATE_URL),
+                              null);
+}
+```
 
 #### 2. 消息拉取
 
 `MQClientInstance#start`启动过程中，会使用一个单独的线程`pullMessageService`进行消息的拉取。
 
-因此，`PullMessageService`只有在得到`PullRequest`对象时才会执行拉取任务，`PullRequest`的生成地方共有2处：
+```java
+// MQClientInstance启动方法
+public void start() throws MQClientException {
+  synchronized (this) {
+    switch (this.serviceState) {
+      case CREATE_JUST:
+        this.serviceState = ServiceState.START_FAILED;
+        // If not specified,looking address from name server
+        if (null == this.clientConfig.getNamesrvAddr()) {
+          this.mQClientAPIImpl.fetchNameServerAddr();
+        }
+        // Start request-response channel
+        this.mQClientAPIImpl.start();
+        // Start various schedule tasks
+        this.startScheduledTask();
+        // Start pull service (启动拉起消息线程)
+        this.pullMessageService.start();
+        // Start rebalance service
+        this.rebalanceService.start();
+        // Start push service
+        this.defaultMQProducer.getDefaultMQProducerImpl().start(false);
+        log.info("the client factory [{}] start OK", this.clientId);
+        this.serviceState = ServiceState.RUNNING;
+        break;
+      case START_FAILED:
+        throw new MQClientException("The Factory object[" + this.getClientId() + "] has been created before, and failed.", null);
+      default:
+        break;
+    }
+  }
+}
+```
+
+`PullMessageService`只有在得到`PullRequest`对象时才会执行拉取任务，`PullRequest`的生成地方共有2处：
 
 1. 一个是在`RocketMQ`根据`PullRequest`拉取任务执行完一次消息拉取任务后，又将`PullRequest`对象放入`pullRequestQueue`；
 2. 另一个是在`RebalanceImpl`中创建的。
@@ -1368,9 +1465,10 @@ if (this.getMessageListenerInner() instanceof MessageListenerOrderly) {
 ```java
 public void run() {
     log.info(this.getServiceName() + " service started");
-
+		// Stopped声明为volatile，停止正在运行线程的设计技巧
     while (!this.isStopped()) {
         try {
+            // pullRequest为空，则获取阻塞
             PullRequest pullRequest = this.pullRequestQueue.take();
             // 这里会将pullRequest重新放入pullRequestQueue中，重新执行消息拉取任务
             this.pullMessage(pullRequest);
@@ -1384,11 +1482,32 @@ public void run() {
 }
 ```
 
-> 拉取流程
+- `PullRequest`组成
+
+```java
+public class PullRequest {
+  // 消费者组
+  private String consumerGroup;
+  // 待拉取消费队列（负载均衡）
+  private MessageQueue messageQueue;
+  // 消息处理队列，从Broker中拉取到的消息会先存入ProccessQueue，然后再提交到消费者消费线程池进行消费。
+  private ProcessQueue processQueue;
+  // 待拉取的MessageQueue偏移量
+  private long nextOffset;
+  // 是否被锁定
+  private boolean previouslyLocked = false;
+}
+```
+
+> 消息拉取基本流程
 
 1. 客户端封装消息拉取请求
 
 `org.apache.rocketmq.client.impl.consumer.DefaultMQPushConsumerImpl#pullMessage`
+
+这里会触发流控：主要的考量是担心因为一条消息堵塞，使消息进度无法向前推进，可能会造成大量消息重复消费。当触发流控时，会将`pullRequest`放到延迟队列中，延迟执行。
+
+真正执行拉取消息的操作：`org.apache.rocketmq.client.impl.consumer.PullAPIWrapper#pullKernelImpl`
 
 2. 消息服务器查找消息并返回
 
