@@ -6,6 +6,8 @@ Apache中文文档：https://www.itmuch.com/books/rocketmq/RocketMQ_Example.html
 
 控制台查询消息：https://help.aliyun.com/document_detail/29540.html
 
+RocketMQ配置解释：https://www.cnblogs.com/jice/p/11981107.html
+
 - 一些博客
 
 Klutzoder'Blog：https://www.klutzoder.com/RocketMQ/middleware/rocketmq-03/
@@ -1501,7 +1503,7 @@ public class PullRequest {
 
 > 消息拉取基本流程
 
-1. 客户端封装消息拉取请求
+1. **客户端封装消息拉取请求**
 
 `org.apache.rocketmq.client.impl.consumer.DefaultMQPushConsumerImpl#pullMessage`
 
@@ -1509,15 +1511,58 @@ public class PullRequest {
 
 真正执行拉取消息的操作：`org.apache.rocketmq.client.impl.consumer.PullAPIWrapper#pullKernelImpl`
 
-2. 消息服务器查找消息并返回
+2. **消息服务器查找消息并返回**
 
 `org.apache.rocketmq.broker.processor.PullMessageProcessor#processRequest(io.netty.channel.ChannelHandlerContext, org.apache.rocketmq.remoting.protocol.RemotingCommand)`
 
-3. 消息拉取客户端处理返回的消息
+```java
+// 执行查找消息
+// 查找条件: consumerGroup、topic、queueId
+// offset(待拉取偏移量)、maMsgNums(最大拉取消息数)、messageFilter(消息过滤器)
+final GetMessageResult getMessageResult =
+            this.brokerController.getMessageStore().getMessage(requestHeader.getConsumerGroup(), requestHeader.getTopic(),
+                requestHeader.getQueueId(), requestHeader.getQueueOffset(), requestHeader.getMaxMsgNums(), messageFilter);
+```
+
+因为主从同步会存在延迟，这一步会设置下一次建议拉取的`brokerId`。如果从节点数据包含下一次拉取的偏移量，则设置下一次拉取任务建议从slave中拉取。
+
+```java
+// 是否包含下次偏移量, 是否建议从slave中拉取
+long diff = maxOffsetPy - maxPhyOffsetPulling;
+                        long memory = (long) (StoreUtil.TOTAL_PHYSICAL_MEMORY_SIZE
+                            * (this.messageStoreConfig.getAccessMessageInMemoryMaxRatio() / 100.0));
+                        getResult.setSuggestPullingFromSlave(diff > memory);
+```
+
+
+建议拉取Broker的判断条件：
+
+1. salve是否可读  ：否 -> 从master中拉取
+2. `isSuggestPullingFromSlave == true` ：当前消费较慢了，`brokerId`从配置项`whichBrokerWhenConsumeSlowly`中获取。
+3. `isSuggestPullingFromSlave == false`：当前消费速度正常，使用订阅组建议的`brokerId`拉取消息进行消费，默认为master。
+
+```java
+if (this.brokerController.getBrokerConfig().isSlaveReadEnable()) {
+  // consume too slow ,redirect to another machine
+  if (getMessageResult.isSuggestPullingFromSlave()) {
+    responseHeader.setSuggestWhichBrokerId(subscriptionGroupConfig.getWhichBrokerWhenConsumeSlowly());
+  }
+  // consume ok
+  else {
+    responseHeader.setSuggestWhichBrokerId(subscriptionGroupConfig.getBrokerId());
+  }
+} else {
+  responseHeader.setSuggestWhichBrokerId(MixAll.MASTER_ID);
+}
+```
+
+3. **消息拉取客户端处理返回的消息**
 
 `org.apache.rocketmq.client.impl.MQClientAPIImpl#pullMessageAsync`
 
 `DefaultMQPushConsumerImpl$PullCallBack#onSuccess`
+
+![消息拉取流程](https://klutzoder-blog.oss-cn-beijing.aliyuncs.com/2020/03/xiao-xi-la-qu-liu-cheng-zong-jie.png?x-oss-process=image/auto-orient,1/quality,q_90/watermark,text_a2x1dHpvZGVy,color_0c0c0c,size_20,g_se,x_10,y_10)
 
 #### 3. 消息消费
 
@@ -1567,6 +1612,8 @@ public class PullRequest {
 - 消费者线程池处理消息
 
 `org.apache.rocketmq.client.impl.consumer.ConsumeMessageConcurrentlyService.ConsumeRequest#run`
+
+#### 4. 负载均衡
 
 
 
