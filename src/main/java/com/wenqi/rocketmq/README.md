@@ -1724,9 +1724,16 @@ private void rebalanceByTopic(final String topic, final boolean isOrder) {
 
 ![consumer的负载均衡](README.assets/consumer%E7%9A%84%E8%B4%9F%E8%BD%BD%E5%9D%87%E8%A1%A1.png)
 
+整体流程图
+
+![](README.assets/PullMessageService%E7%BA%BF%E7%A8%8B%E4%B8%8ERebalanceService%E7%BA%BF%E7%A8%8B%E4%BA%A4%E4%BA%92.png)
+
+
 > 消息负载算法如果没有特殊的要求，尽量使用`AllocateMessageQueueAveragely`、`AllocateMessageQueueAveragelyByCircle`，这是因为分配算法比较直观。
 >
 > 消息队列分配原则为一个消费者可以分配多个消息队列，但同一个消息队列只会分配给一个消费者，故如果消费者个数大于消息队列数量，则有些消费者无法消费消息。
+>
+> 同一个消息队列只会分配给一个消费者：通过对队列和消费者实例id排序实现，保证每个消费者实例看到的分配的视图都是一致的，所以分配时才能保证同一个队列分配给同一个消费者。假如consumer 1被consumer 2分配了新的队列Entry 5和Entry 6，consumer 1会在负载均衡最后对比一下已负载均衡分配的队列和同步的队列，发现有新的队列就创建`pullRequest`提交到`pullRequestQueue`。
 
 # 思考点
 
