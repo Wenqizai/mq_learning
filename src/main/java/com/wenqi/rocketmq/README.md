@@ -46,13 +46,14 @@ Tag 和 Key 的主要差别是使用场景不同，Tag 用在 Consumer 代码中
 
 ### Consumer Group
 
-一个Group相当于一个订阅者，当消费模式是广播模式，消息会发送到所有的消费组中供消费（注意：不是所有消费者队列）；当消费模式是集群模式，消费会按照负载均衡策略，轮流发送消息到每个消费者组中（注意：消息只会发送到某一个Group）。
-
 不同的消费组是从ConsumeQueue中拉取消息，消费消息后会记录消费的最大offset，表示之前的消息都已经消费过了，这个offset是保存再消费者组中，不是ConsumeQueue中。ConsumeQueue被消费消息后只是标记为已读状态，并不会删除消息，未删除的消息可供其他消费组消费。
 
 这意味着，不同的group独自保存自己的消费offset，不同group的消费进度独立不相互影响。比如：a.  group 1发送积压，并不会影响到group 2的消费；b. group 1已经消费过了消息，group 2照样可以消费。
 
-consumer group最大作用于消费是集群模式，还是广播模式。
+==注意：==
+
+1. 广播模式：消息发送到所有的consumer group下的所有的consumer实例。
+2. 集群模式：消息发送到所有consumer group下的其中某一个consumer实例。
 
 # Quick Start
 
@@ -1615,7 +1616,117 @@ if (this.brokerController.getBrokerConfig().isSlaveReadEnable()) {
 
 #### 4. 负载均衡
 
+我们知道consumer从`pullRequestQueue`中获取`PullRequest`对象，进行消息的拉取和消费。这意味者`PullRequest`对象的创建放入队列时，已经完成的负载均衡的操作。所以若要搞清楚消费者的负载均衡机制，就从`PullRequest`对象创建说起。
 
+1. `MQClientInstance`启动过程中，会`new RebalanceService()`负责consumer的负载均衡的线程，每20s运行一遍。（`org.apache.rocketmq.client.impl.consumer.RebalanceService#run`）
+
+```java
+@Override
+public void run() {
+  log.info(this.getServiceName() + " service started");
+
+  while (!this.isStopped()) {
+    // 等待20s，可配置
+    this.waitForRunning(waitInterval);
+    // 执行负载均衡操作
+    this.mqClientFactory.doRebalance();
+  }
+
+  log.info(this.getServiceName() + " service end");
+}
+```
+
+2. 遍历已注册到`MQClientInstance`中消费者对象（`consumerTable`），并执行负载均衡
+
+```java
+public void doRebalance() {
+  for (Map.Entry<String, MQConsumerInner> entry : this.consumerTable.entrySet()) {
+    MQConsumerInner impl = entry.getValue();
+    if (impl != null) {
+      try {
+        impl.doRebalance();
+      } catch (Throwable e) {
+        log.error("doRebalance exception", e);
+      }
+    }
+  }
+}
+```
+
+3. 根据Topic获取所有的订阅信息。`org.apache.rocketmq.client.impl.consumer.RebalanceImpl#doRebalance`
+
+```java
+public void doRebalance(final boolean isOrder) {
+  // 获取订阅信息
+  // 订阅信息在调用消费者DefaultMQPushConsumerImpl#subscribe方法时填充
+  Map<String, SubscriptionData> subTable = this.getSubscriptionInner();
+  if (subTable != null) {
+    for (final Map.Entry<String, SubscriptionData> entry : subTable.entrySet()) {
+      final String topic = entry.getKey();
+      try {
+        // 负载均衡的核心方法
+        this.rebalanceByTopic(topic, isOrder);
+      } catch (Throwable e) {
+        if (!topic.startsWith(MixAll.RETRY_GROUP_TOPIC_PREFIX)) {
+          log.warn("rebalanceByTopic Exception", e);
+        }
+      }
+    }
+  }
+  // 查看DefaultMQPushConsumerImpl#unsubscribe发现：取消订阅时只是移除subTable的信息，而processQueueTable的信息并没移除
+  // 这个方法就是执行就是将不关心的主题消费队列从processQueueTable中移除
+  this.truncateMessageQueueNotMyTopic();
+}
+```
+
+4. 从主题订阅信息缓存表中获取主题的队列信息（`mqSet`），同时从Broker中获取该消费组内当前所有的消费者客户端ID（`cidAll`）。执行负载均衡之前对两者进行排序。`org.apache.rocketmq.client.impl.consumer.RebalanceImpl#rebalanceByTopic`
+
+```java
+private void rebalanceByTopic(final String topic, final boolean isOrder) {
+  switch (messageModel) {
+    case BROADCASTING: {
+      // 省略广播模式（注：广播模式只需队列均衡，所有cid都会发一份）
+    case CLUSTERING: {
+      // 主题订阅信息缓存表中获取主题的队列信息
+      Set<MessageQueue> mqSet = this.topicSubscribeInfoTable.get(topic);
+      // find by consumer group, 获取本消费者组下的所有消费者client id
+      List<String> cidAll = this.mQClientFactory.findConsumerIdList(topic, consumerGroup);
+     	// 同时不为空才进行负载均衡
+      if (mqSet != null && cidAll != null) {
+        List<MessageQueue> mqAll = new ArrayList<MessageQueue>();
+        mqAll.addAll(mqSet);
+			  // 先排序，同一个消费组内看到的视图应保持一致，确保同一个消费队列不会被多个消费者分配
+        Collections.sort(mqAll);
+        Collections.sort(cidAll);
+        
+        // 省略执行均衡策略过程...
+        
+        Set<MessageQueue> allocateResultSet = new HashSet<MessageQueue>();
+        if (allocateResult != null) {
+          allocateResultSet.addAll(allocateResult);
+        }
+
+        // 这个方法用来检查Broker的队列是否发生了变化，用当前负载队列allocateResultSet进行对比
+        boolean changed = this.updateProcessQueueTableInRebalance(topic, allocateResultSet, isOrder);
+        if (changed) {
+          // 发生了变化，更新
+          this.messageQueueChanged(topic, mqSet, allocateResultSet);
+        }
+      }
+      break;
+    }
+    default:
+      break;
+  }
+```
+
+5. 移除负载均衡队列中的无用的队列，将新的队列创建一个新的`PullRequest`加入到消息拉取线程中`PullMessageService`。`org.apache.rocketmq.client.impl.consumer.RebalanceImpl#updateProcessQueueTableInRebalance`
+
+![consumer的负载均衡](README.assets/consumer%E7%9A%84%E8%B4%9F%E8%BD%BD%E5%9D%87%E8%A1%A1.png)
+
+> 消息负载算法如果没有特殊的要求，尽量使用`AllocateMessageQueueAveragely`、`AllocateMessageQueueAveragelyByCircle`，这是因为分配算法比较直观。
+>
+> 消息队列分配原则为一个消费者可以分配多个消息队列，但同一个消息队列只会分配给一个消费者，故如果消费者个数大于消息队列数量，则有些消费者无法消费消息。
 
 # 思考点
 
