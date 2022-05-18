@@ -2005,6 +2005,22 @@ private CompletableFuture<RemotingCommand> asyncConsumerSendMsgBack(ChannelHandl
 
 ##### 3.2 顺序消费
 
+##### 3.3 消费进度
+
+广播模式：同一Consume Group下的所有consumer都需要消费消息。因此消费进度应该是每个consumer独立保存的。
+
+集群模式：同一Consume Group下，一条消息只会分配给一个consumer。因此消费进度对于每个的consumer都是可见，可访问的。
+
+> 广播模式
+
+广播模式消费进度保存地方：`org.apache.rocketmq.client.consumer.store.LocalFileOffsetStore`
+
+> 集群模式
+
+集群模式消费进度保存方法：`org.apache.rocketmq.client.consumer.store.RemoteBrokerOffsetStore`。消费进度保存地方：consumer内存，Broker内存和磁盘。
+
+集群模式本地保存一份进度`offsetTable`，持久化是通过网络同步到Broker的内存中，然后由Broker负责定时持久化（持久化规则：topic@group，相当于每个group都独立保存一份进度）。Broker处理消费进度地方：`org.apache.rocketmq.broker.offset.ConsumerOffsetManager#commitOffset(java.lang.String, java.lang.String, java.lang.String, int, long)`
+
 #### 4. 负载均衡
 
 我们知道consumer从`pullRequestQueue`中获取`PullRequest`对象，进行消息的拉取和消费。这意味者`PullRequest`对象的创建放入队列时，已经完成的负载均衡的操作。所以若要搞清楚消费者的负载均衡机制，就从`PullRequest`对象创建说起。
@@ -2119,12 +2135,104 @@ private void rebalanceByTopic(final String topic, final boolean isOrder) {
 
 ![](README.assets/PullMessageService%E7%BA%BF%E7%A8%8B%E4%B8%8ERebalanceService%E7%BA%BF%E7%A8%8B%E4%BA%A4%E4%BA%92.png)
 
+6. 在进行消息负载时，如果消息消费队列被分配给其他消费者，会将该`ProcessQueue`状态设置为`droped`，持久化该消息队列的消费进度，并从内存中将其移除。
+
+   `org.apache.rocketmq.client.impl.consumer.RebalanceImpl#removeUnnecessaryMessageQueue`
+
+```java
+if (mq.getTopic().equals(topic)) {
+    if (!mqSet.contains(mq)) {
+        pq.setDropped(true);
+        // 持久化消费进度，并移除内存的消费进度（集群模式：本地， Broker内存和磁盘都会保存一份）
+        if (this.removeUnnecessaryMessageQueue(mq, pq)) {
+            it.remove();
+            changed = true;
+            log.info("doRebalance, {}, remove unnecessary mq, {}", consumerGroup, mq);
+        }
+    } else if (pq.isPullExpired()) {
+        switch (this.consumeType()) {
+            case CONSUME_ACTIVELY:
+                break;
+            case CONSUME_PASSIVELY:
+                pq.setDropped(true);
+                if (this.removeUnnecessaryMessageQueue(mq, pq)) {
+                    it.remove();
+                    changed = true;
+                    log.error("[BUG]doRebalance, {}, remove unnecessary mq, {}, because pull is pause, so try to fixed it",
+                              consumerGroup, mq);
+                }
+                break;
+            default:
+                break;
+        }
+    }
+}
+```
+
 
 > 消息负载算法如果没有特殊的要求，尽量使用`AllocateMessageQueueAveragely`、`AllocateMessageQueueAveragelyByCircle`，这是因为分配算法比较直观。
 >
 > 消息队列分配原则为一个消费者可以分配多个消息队列，但同一个消息队列只会分配给一个消费者，故如果消费者个数大于消息队列数量，则有些消费者无法消费消息。
 >
 > 同一个消息队列只会分配给一个消费者：通过对队列和消费者实例id排序实现，保证每个消费者实例看到的分配的视图都是一致的，所以分配时才能保证同一个队列分配给同一个消费者。假如consumer 1被consumer 2分配了新的队列Entry 5和Entry 6，consumer 1会在负载均衡最后对比一下已负载均衡分配的队列和同步的队列，发现有新的队列就创建`pullRequest`提交到`pullRequestQueue`。
+
+#### 5.消息拉取与消费进度
+
+消费拉取线程定时从broker拉取消息，保存到本地`ProcessQueue`中，存储结构`TreeMap<Long /*偏移量*/, MessageExt /*消息*/> msgTreeMap = new TreeMap<Long, MessageExt>();`。然后提交到消费者线程池处理。消费者线程池每处理完一个消息消费任务（`ConsumeRequest`），会从`ProcessQueue`中移除本批消费的消息，并返回`ProcessQueue`中最小的偏移量，用该偏移量更新消息队列消费进度，也就是说==更新消费进度与消费任务中的消息没有关系==。
+
+- 例如：
+
+现在有两个消费任务`task1`（`queueOffset`分别为20、40）和`task2`（`queueOffset`分别为50、70），并且`ProcessQueue`中当前包含最小消息偏移量为10的消息。
+
+1. `task2`消费结束后，将使用10更新消费进度，而不是70。
+2. `task1`消费结束后，还是以10更新消息队列消费进度。
+
+==消息消费进度的推进取决于`ProcessQueue`中偏移量最小的消息消费速度。==如果偏移量为10的消息消费成功，且`ProcessQueue`中包含消息偏移量为100的消息，则消息偏移量为10的消息消费成功后，将直接用100更新消息消费进度。
+
+- 问题
+
+如果在消费消息偏移量为10的消息时发生了死锁，会导致消息一直无法被消费，岂不是消息进度无法向前推进了？
+
+是的，为了避免这种情况，`RocketMQ`引入了一种消息拉取流控措施：`DefaultMQPushConsumer#consumeConcurrentlyMaxSpan = 2000`，消息处理队列`ProcessQueue`中最大消息偏移与最小偏移量不能超过该值，如果超过该值，将触发流控，延迟该消息队列的消息拉取。
+
+```java
+public long removeMessage(final List<MessageExt> msgs) {
+    // 初始化消费进度 -1
+    long result = -1;
+    final long now = System.currentTimeMillis();
+    try {
+        this.treeMapLock.writeLock().lockInterruptibly();
+        this.lastConsumeTimestamp = now;
+        try {
+            if (!msgTreeMap.isEmpty()) {
+                // 本地消息不为空，消费进度为队列最大偏移量
+                result = this.queueOffsetMax + 1;
+                int removedCnt = 0;
+                for (MessageExt msg : msgs) {
+                    // 从msgTreeMap中移除改消息，
+                    MessageExt prev = msgTreeMap.remove(msg.getQueueOffset());
+                    if (prev != null) {
+                        removedCnt--;
+                        msgSize.addAndGet(0 - msg.getBody().length);
+                    }
+                }
+                msgCount.addAndGet(removedCnt);
+
+                if (!msgTreeMap.isEmpty()) {
+                    // 移除已经消费消息之后，本地消息不为空，返回消费进度为最小偏移量
+                    result = msgTreeMap.firstKey();
+                }
+            }
+        } finally {
+            this.treeMapLock.writeLock().unlock();
+        }
+    } catch (Throwable t) {
+        log.error("removeMessage exception", t);
+    }
+
+    return result;
+}
+```
 
 # 思考点
 
@@ -2541,7 +2649,20 @@ if (!this.consumeOrderly) {
 
 在使用的时候，根据打印的日志可以分析具体是哪种情况的流量控制，并采用相应的措施。
 
+### 重复消费产生地方
+
+1. consumer消费消息后就会根据偏移量来移除本地的消息，提交消费进度。多线程场景下，每次提交只会提交本地消息的最小偏移量，因此消息拉取线程会根据偏移量拉取消息到本地进行消费。这是就会拉取到已经消费的消息，重复消费，因为此时消息进度是最少偏移量。
+
+```java
+// 本地消息保存在ProcessQueue.msgTreeMap
+TreeMap<Long /*偏移量*/, MessageExt /*消息*/> msgTreeMap = new TreeMap<Long, MessageExt>();
+```
+
 ### 疑问点，待解决
 
 1. 延迟消息，重试消息都是创建一个msgId，放在一个统一Topic里面，不影响正常消息的消费进度吗？
+
+   是的，可参看消息确认过程。
+
+
 
