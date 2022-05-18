@@ -14,7 +14,8 @@ public class Producer {
         // 实例化消息生产者Product
         DefaultMQProducer producer = new DefaultMQProducer("source-producer-quick-start");
         // 设置NameServer的地址
-        producer.setNamesrvAddr("127.0.0.1:9876;10.0.88.229:9876");
+        //producer.setNamesrvAddr("127.0.0.1:9876;10.0.88.229:9876");
+        producer.setNamesrvAddr("127.0.0.1:9876");
         producer.setSendMsgTimeout(Integer.MAX_VALUE);
         producer.setRetryTimesWhenSendFailed(1);
         producer.setRetryAnotherBrokerWhenNotStoreOK(true);

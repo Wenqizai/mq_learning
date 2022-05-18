@@ -1571,7 +1571,9 @@ if (this.brokerController.getBrokerConfig().isSlaveReadEnable()) {
 
 `org.apache.rocketmq.client.impl.consumer.ConsumeMessageService#submitConsumeRequest`
 
-##### 并发消费
+##### 3.1 并发消费
+
+###### 消息消费
 
 1. 提交给消费线程池
 
@@ -1764,6 +1766,7 @@ public void processConsumeResult(
             case CLUSTERING:
                // 集群模式: 执行sendMessageBack发送ack
                 List<MessageExt> msgBackFailed = new ArrayList<MessageExt>(consumeRequest.getMsgs().size());
+                // 消费状态是RECONSUME_LATER才会走到这里
                 for (int i = ackIndex + 1; i < consumeRequest.getMsgs().size(); i++) {
                     MessageExt msg = consumeRequest.getMsgs().get(i);
                     boolean result = this.sendMessageBack(msg, context);
@@ -1775,15 +1778,15 @@ public void processConsumeResult(
 
                 if (!msgBackFailed.isEmpty()) {
                     consumeRequest.getMsgs().removeAll(msgBackFailed);
-									// ack发送失败延迟执行
+				   // ack发送失败延迟执行
                     this.submitConsumeRequestLater(msgBackFailed, consumeRequest.getProcessQueue(), consumeRequest.getMessageQueue());
                 }
                 break;
             default:
                 break;
         }
-			 // 从ProcessQueue中移除这批消息
-  		 // 这里返回移除消费消息后队列的最小偏移量
+		// 从ProcessQueue中移除这批消息
+  		// 这里返回移除消费消息后队列的最小偏移量
         long offset = consumeRequest.getProcessQueue().removeMessage(consumeRequest.getMsgs());
         if (offset >= 0 && !consumeRequest.getProcessQueue().isDropped()) {
             // 用最小偏移量offset来更新消费进度
@@ -1792,9 +1795,21 @@ public void processConsumeResult(
     }
 ```
 
-> 从ProcessQueue中移除这批消息，这里返回的偏移量是移除该批消息后最小的偏移量。然后用该偏移量更新消息消费进度，以便消费者重启后能从上一次的消费进度开始消费，避免消息重复消费。值得注意的是，当消息监听器返回RECONSUME_LATER时，消息消费进度也会向前推进，并用ProcessQueue中最小的队列偏移量调用消息消费进度存储器OffsetStore更新消费进度。这是因为当返回RECONSUME_LATER时，RocketMQ会创建一条与原消息属性相同的消息，拥有一个唯一的新msgId，并存储原消息ID，该消息会存入CommitLog文件，与原消息没有任何关联，所以该消息也会进入ConsuemeQueue，并拥有一个全新的队列偏移量。
+> 从`ProcessQueue`中移除这批消息，这里返回的偏移量是移除该批消息后最小的偏移量。然后用该偏移量更新消息消费进度，以便消费者重启后能从上一次的消费进度开始消费，避免消息重复消费。值得注意的是，当消息监听器返回`RECONSUME_LATER`时，消息消费进度也会向前推进，并用`ProcessQueue`中最小的队列偏移量调用消息消费进度存储器`OffsetStore`更新消费进度。这是因为当返回`RECONSUME_LATER`时，`RocketMQ`会创建一条与原消息属性相同的消息，拥有一个唯一的新`msgId`，并存储原消息ID，该消息会存入`CommitLog`文件，与原消息没有任何关联，所以该消息也会进入`ConsuemeQueue`，并拥有一个全新的队列偏移量。
 
-##### 顺序消费
+###### 消息确认
+
+如果消息监听器返回的消费结果为`RECONSUME_LATER`，则需要将这些消息发送给Broker来延迟消息。`org.apache.rocketmq.client.impl.consumer.ConsumeMessageConcurrentlyService#sendMessageBack`
+
+
+
+
+
+
+
+
+
+##### 3.2 顺序消费
 
 #### 4. 负载均衡
 
@@ -2331,4 +2346,8 @@ if (!this.consumeOrderly) {
 `RocketMQ` 发生流量控制的 8 个场景，其中 Broker 4 个场景，Consumer 4 个场景。Broker 的流量控制，本质是对 Producer 的流量控制，最好的解决方法就是给 Broker 扩容，增加 Broker 写入能力。而对于 Consumer 端的流量控制，需要解决 Consumer 端消费慢的问题，比如有第三方接口响应慢或者有慢 SQL。
 
 在使用的时候，根据打印的日志可以分析具体是哪种情况的流量控制，并采用相应的措施。
+
+### 疑问点，待解决
+
+1. 延迟消息，重试消息都是创建一个msgId，放在一个统一Topic里面，不影响正常消息的消费进度吗？
 

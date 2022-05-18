@@ -17,7 +17,8 @@ public class Consumer {
         DefaultMQPushConsumer consumer = new DefaultMQPushConsumer("source-consumer-quick-start");
 
         // 设置NameServer地址
-        consumer.setNamesrvAddr("127.0.0.1:9876;127.0.0.1:19876");
+        consumer.setNamesrvAddr("127.0.0.1:9876");
+        //consumer.setNamesrvAddr("127.0.0.1:9876;127.0.0.1:19876");
 
         // 订阅一个或者多个Topic, 以及Tag来过滤需要消费的消息
         consumer.subscribe("TopicTest", "*");
@@ -30,7 +31,7 @@ public class Consumer {
             // MessageListenerConcurrently: 并发消费, MessageListenerOrderly: 顺序消费
             System.out.printf("%s Receive New Messages: %s %n", Thread.currentThread().getName(), msgs);
             // 标记该消息已经被成功消费
-            return ConsumeConcurrentlyStatus.CONSUME_SUCCESS;
+            return ConsumeConcurrentlyStatus.RECONSUME_LATER;
         });
 
         // 启动消费者实例
