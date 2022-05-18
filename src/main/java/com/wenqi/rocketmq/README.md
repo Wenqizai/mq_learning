@@ -1797,17 +1797,211 @@ public void processConsumeResult(
 
 > 从`ProcessQueue`中移除这批消息，这里返回的偏移量是移除该批消息后最小的偏移量。然后用该偏移量更新消息消费进度，以便消费者重启后能从上一次的消费进度开始消费，避免消息重复消费。值得注意的是，当消息监听器返回`RECONSUME_LATER`时，消息消费进度也会向前推进，并用`ProcessQueue`中最小的队列偏移量调用消息消费进度存储器`OffsetStore`更新消费进度。这是因为当返回`RECONSUME_LATER`时，`RocketMQ`会创建一条与原消息属性相同的消息，拥有一个唯一的新`msgId`，并存储原消息ID，该消息会存入`CommitLog`文件，与原消息没有任何关联，所以该消息也会进入`ConsuemeQueue`，并拥有一个全新的队列偏移量。
 
+```txt
+# 发送的消息
+SendResult [sendStatus=SEND_OK, msgId=7F00000175CC18B4AAC259C3E2040000, offsetMsgId=0A00593B00002A9F000000000003AC51, messageQueue=MessageQueue [topic=TopicTest, brokerName=broker-a, queueId=3], queueOffset=120]
+
+# 消费状态返回RECONSUME_LATER，重新消费的消息，可以看到源消息的属性放在Message.properties里面
+ConsumeMessageThread_source-consumer-quick-start_1 Receive New Messages: [MessageExt [brokerName=broker-a, queueId=3, storeSize=198, queueOffset=120, sysFlag=0, bornTimestamp=1652840409604, bornHost=/10.0.89.59:61748, storeTimestamp=1652840409609, storeHost=/10.0.89.59:10911, msgId=0A00593B00002A9F000000000003AC51, commitLogOffset=240721, bodyCRC=1446496313, reconsumeTimes=0, preparedTransactionOffset=0, toString()=Message{topic='TopicTest', flag=0, properties={MIN_OFFSET=0, MAX_OFFSET=121, CONSUME_START_TIME=1652840409617, UNIQ_KEY=7F00000175CC18B4AAC259C3E2040000, CLUSTER=DefaultCluster, TAGS=TagA}, body=[83, 111, 117, 114, 99, 101, 32, 58, 32, 72, 101, 108, 108, 111, 32, 82, 111, 99, 107, 101, 116, 77, 81, 48], transactionId='null'}]] 
+ConsumeMessageThread_source-consumer-quick-start_2 Receive New Messages: [MessageExt [brokerName=broker-a, queueId=0, storeSize=372, queueOffset=42, sysFlag=0, bornTimestamp=1652840409604, bornHost=/10.0.89.59:61748, storeTimestamp=1652840491965, storeHost=/10.0.89.59:10911, msgId=0A00593B00002A9F000000000003AE7C, commitLogOffset=241276, bodyCRC=1446496313, reconsumeTimes=1, preparedTransactionOffset=0, toString()=Message{topic='TopicTest', flag=0, properties={MIN_OFFSET=0, REAL_TOPIC=%RETRY%source-consumer-quick-start, ORIGIN_MESSAGE_ID=0A00593B00002A9F000000000003AC51, RETRY_TOPIC=TopicTest, MAX_OFFSET=43, CONSUME_START_TIME=1652840492137, UNIQ_KEY=7F00000175CC18B4AAC259C3E2040000, CLUSTER=DefaultCluster, WAIT=false, DELAY=3, TAGS=TagA, REAL_QID=0}, body=[83, 111, 117, 114, 99, 101, 32, 58, 32, 72, 101, 108, 108, 111, 32, 82, 111, 99, 107, 101, 116, 77, 81, 48], transactionId='null'}]] 
+ConsumeMessageThread_source-consumer-quick-start_3 Receive New Messages: [MessageExt [brokerName=broker-a, queueId=0, storeSize=372, queueOffset=43, sysFlag=0, bornTimestamp=1652840409604, bornHost=/10.0.89.59:61748, storeTimestamp=1652840522157, storeHost=/10.0.89.59:10911, msgId=0A00593B00002A9F000000000003B155, commitLogOffset=242005, bodyCRC=1446496313, reconsumeTimes=2, preparedTransactionOffset=0, toString()=Message{topic='TopicTest', flag=0, properties={MIN_OFFSET=0, REAL_TOPIC=%RETRY%source-consumer-quick-start, ORIGIN_MESSAGE_ID=0A00593B00002A9F000000000003AC51, RETRY_TOPIC=TopicTest, MAX_OFFSET=44, CONSUME_START_TIME=1652840522159, UNIQ_KEY=7F00000175CC18B4AAC259C3E2040000, CLUSTER=DefaultCluster, WAIT=false, DELAY=4, TAGS=TagA, REAL_QID=0}, body=[83, 111, 117, 114, 99, 101, 32, 58, 32, 72, 101, 108, 108, 111, 32, 82, 111, 99, 107, 101, 116, 77, 81, 48], transactionId='null'}]] 
+ConsumeMessageThread_source-consumer-quick-start_4 Receive New Messages: [MessageExt [brokerName=broker-a, queueId=0, storeSize=372, queueOffset=44, sysFlag=0, bornTimestamp=1652840409604, bornHost=/10.0.89.59:61748, storeTimestamp=1652840582237, storeHost=/10.0.89.59:10911, msgId=0A00593B00002A9F000000000003B42E, commitLogOffset=242734, bodyCRC=1446496313, reconsumeTimes=3, preparedTransactionOffset=0, toString()=Message{topic='TopicTest', flag=0, properties={MIN_OFFSET=0, REAL_TOPIC=%RETRY%source-consumer-quick-start, ORIGIN_MESSAGE_ID=0A00593B00002A9F000000000003AC51, RETRY_TOPIC=TopicTest, MAX_OFFSET=45, CONSUME_START_TIME=1652840582241, UNIQ_KEY=7F00000175CC18B4AAC259C3E2040000, CLUSTER=DefaultCluster, WAIT=false, DELAY=5, TAGS=TagA, REAL_QID=0}, body=[83, 111, 117, 114, 99, 101, 32, 58, 32, 72, 101, 108, 108, 111, 32, 82, 111, 99, 107, 101, 116, 77, 81, 48], transactionId='null'}]] 
+
+```
+
 ###### 消息确认
 
 如果消息监听器返回的消费结果为`RECONSUME_LATER`，则需要将这些消息发送给Broker来延迟消息。`org.apache.rocketmq.client.impl.consumer.ConsumeMessageConcurrentlyService#sendMessageBack`
 
+> consumer发送过程
 
+`org.apache.rocketmq.client.impl.MQClientAPIImpl#consumerSendMessageBack`
 
+```java
+public void consumerSendMessageBack(final String addr, final MessageExt msg, final String consumerGroup, final int delayLevel, final long timeoutMillis, final int maxConsumeRetryTimes) throws RemotingException, MQBrokerException, InterruptedException {
+    ConsumerSendMsgBackRequestHeader requestHeader = new ConsumerSendMsgBackRequestHeader();
+    // 请求码：RequestCode.CONSUMER_SEND_MSG_BACK
+    RemotingCommand request = RemotingCommand.createRequestCommand(RequestCode.CONSUMER_SEND_MSG_BACK, requestHeader);
+	// 将源消息的属性设置到requestHeader中
+    requestHeader.setGroup(consumerGroup);
+    requestHeader.setOriginTopic(msg.getTopic());
+    requestHeader.setOffset(msg.getCommitLogOffset());
+    requestHeader.setDelayLevel(delayLevel);
+    requestHeader.setOriginMsgId(msg.getMsgId());
+    requestHeader.setMaxReconsumeTimes(maxConsumeRetryTimes);
+	// 同步发送到Broker
+    RemotingCommand response = this.remotingClient.invokeSync(MixAll.brokerVIPChannel(this.clientConfig.isVipChannelEnabled(), addr),
+                                                              request, timeoutMillis);
+    assert response != null;
+    switch (response.getCode()) {
+        case ResponseCode.SUCCESS: {
+            return;
+        }
+        default:
+            break;
+    }
+	// 注意：这里返回的错误，上一层方法有兜底逻辑，会创建一条新消息发送到重试队列里面
+    throw new MQBrokerException(response.getCode(), response.getRemark(), addr);
+}
+```
 
+> broker处理过程
 
+`org.apache.rocketmq.broker.processor.SendMessageProcessor#asyncProcessRequest(io.netty.channel.ChannelHandlerContext, org.apache.rocketmq.remoting.protocol.RemotingCommand)`
 
+`org.apache.rocketmq.broker.processor.SendMessageProcessor#asyncConsumerSendMsgBack`
 
+```java
+private CompletableFuture<RemotingCommand> asyncConsumerSendMsgBack(ChannelHandlerContext ctx, RemotingCommand request) throws RemotingCommandException {
+    // ...
+    
+    // 根据group来获取订阅配置信息
+    SubscriptionGroupConfig subscriptionGroupConfig = this.brokerController.getSubscriptionGroupManager().findSubscriptionGroupConfig(requestHeader.getGroup());
+    // 注意：一下检验返回的错误，在consumer有兜底逻辑，会创建一条新消息发送到重试队列里面 
+    // 如果配置信息为空，而且不能自动创建配置，返回配置组信息不存在错误
+    if (null == subscriptionGroupConfig) {
+        response.setCode(ResponseCode.SUBSCRIPTION_GROUP_NOT_EXIST);
+        response.setRemark("subscription group not exist, " + requestHeader.getGroup() + " "
+                           + FAQUrl.suggestTodo(FAQUrl.SUBSCRIPTION_GROUP_NOT_EXIST));
+        return CompletableFuture.completedFuture(response);
+    }
+    // broker不可写(消息发给重试队列)
+    if (!PermName.isWriteable(this.brokerController.getBrokerConfig().getBrokerPermission())) {
+        response.setCode(ResponseCode.NO_PERMISSION);
+        response.setRemark("the broker[" + this.brokerController.getBrokerConfig().getBrokerIP1() + "] sending message is forbidden");
+        return CompletableFuture.completedFuture(response);
+    }
+	// 重试队列为0，不可重试，直接返回ResponseCode.SUCCESS，把消息给吞掉
+    if (subscriptionGroupConfig.getRetryQueueNums() <= 0) {
+        response.setCode(ResponseCode.SUCCESS);
+        response.setRemark(null);
+        return CompletableFuture.completedFuture(response);
+    }
+	// 创建可读写的重试队列：topic：%RETRY%+消费组名称，队列数：默认1
+    String newTopic = MixAll.getRetryTopic(requestHeader.getGroup());
+    int queueIdInt = ThreadLocalRandom.current().nextInt(99999999) % subscriptionGroupConfig.getRetryQueueNums();
+    int topicSysFlag = 0;
+    if (requestHeader.isUnitMode()) {
+        topicSysFlag = TopicSysFlag.buildSysFlag(false, true);
+    }
 
+    TopicConfig topicConfig = this.brokerController.getTopicConfigManager().createTopicInSendMessageBackMethod(
+        newTopic,
+        subscriptionGroupConfig.getRetryQueueNums(),
+        PermName.PERM_WRITE | PermName.PERM_READ, topicSysFlag);
+    if (null == topicConfig) {
+        response.setCode(ResponseCode.SYSTEM_ERROR);
+        response.setRemark("topic[" + newTopic + "] not exist");
+        return CompletableFuture.completedFuture(response);
+    }
+
+    if (!PermName.isWriteable(topicConfig.getPerm())) {
+        response.setCode(ResponseCode.NO_PERMISSION);
+        response.setRemark(String.format("the topic[%s] sending message is forbidden", newTopic));
+        return CompletableFuture.completedFuture(response);
+    }
+    // 根据偏移量从commitLog中读取消息
+    MessageExt msgExt = this.brokerController.getMessageStore().lookMessageByOffset(requestHeader.getOffset());
+    if (null == msgExt) {
+        response.setCode(ResponseCode.SYSTEM_ERROR);
+        response.setRemark("look message by offset failed, " + requestHeader.getOffset());
+        return CompletableFuture.completedFuture(response);
+    }
+	// 设置消息msgExt的属性
+    final String retryTopic = msgExt.getProperty(MessageConst.PROPERTY_RETRY_TOPIC);
+    if (null == retryTopic) {
+        MessageAccessor.putProperty(msgExt, MessageConst.PROPERTY_RETRY_TOPIC, msgExt.getTopic());
+    }
+    msgExt.setWaitStoreMsgOK(false);
+
+    int delayLevel = requestHeader.getDelayLevel();
+	// 获取最大重试次数
+    int maxReconsumeTimes = subscriptionGroupConfig.getRetryMaxTimes();
+    if (request.getVersion() >= MQVersion.Version.V3_4_9.ordinal()) {
+        Integer times = requestHeader.getMaxReconsumeTimes();
+        if (times != null) {
+            maxReconsumeTimes = times;
+        }
+    }
+	// 超过最大重试次数，设置topic：%DLQ%+消费组名称，意味着该消息会进入死信队列
+    // 进入DLQ队列，RocketMQ将不负责再次调度消费了，需要人工干预
+    if (msgExt.getReconsumeTimes() >= maxReconsumeTimes
+        || delayLevel < 0) {
+        newTopic = MixAll.getDLQTopic(requestHeader.getGroup());
+        queueIdInt = ThreadLocalRandom.current().nextInt(99999999) % DLQ_NUMS_PER_GROUP;
+
+        topicConfig = this.brokerController.getTopicConfigManager().createTopicInSendMessageBackMethod(newTopic, DLQ_NUMS_PER_GROUP, PermName.PERM_WRITE | PermName.PERM_READ, 0);
+        if (null == topicConfig) {
+            response.setCode(ResponseCode.SYSTEM_ERROR);
+            response.setRemark("topic[" + newTopic + "] not exist");
+            return CompletableFuture.completedFuture(response);
+        }
+        msgExt.setDelayTimeLevel(0);
+    } else {
+        if (0 == delayLevel) {
+            delayLevel = 3 + msgExt.getReconsumeTimes();
+        }
+        msgExt.setDelayTimeLevel(delayLevel);
+    }
+
+    // 创建一条新的消息储存到commitlog，属性内容与源消息保持一致
+    MessageExtBrokerInner msgInner = new MessageExtBrokerInner();
+    msgInner.setTopic(newTopic);
+    msgInner.setBody(msgExt.getBody());
+    msgInner.setFlag(msgExt.getFlag());
+    MessageAccessor.setProperties(msgInner, msgExt.getProperties());
+    msgInner.setPropertiesString(MessageDecoder.messageProperties2String(msgExt.getProperties()));
+    msgInner.setTagsCode(MessageExtBrokerInner.tagsString2tagsCode(null, msgExt.getTags()));
+
+    msgInner.setQueueId(queueIdInt);
+    msgInner.setSysFlag(msgExt.getSysFlag());
+    msgInner.setBornTimestamp(msgExt.getBornTimestamp());
+    msgInner.setBornHost(msgExt.getBornHost());
+    msgInner.setStoreHost(msgExt.getStoreHost());
+    msgInner.setReconsumeTimes(msgExt.getReconsumeTimes() + 1);
+
+    String originMsgId = MessageAccessor.getOriginMessageId(msgExt);
+    MessageAccessor.setOriginMessageId(msgInner, UtilAll.isBlank(originMsgId) ? msgExt.getMsgId() : originMsgId);
+    msgInner.setPropertiesString(MessageDecoder.messageProperties2String(msgExt.getProperties()));
+	// 异步保存到commitlog
+    CompletableFuture<PutMessageResult> putMessageResult = this.brokerController.getMessageStore().asyncPutMessage(msgInner);
+    return putMessageResult.thenApply((r) -> {
+        if (r != null) {
+            switch (r.getPutMessageStatus()) {
+                case PUT_OK:
+                    String backTopic = msgExt.getTopic();
+                    String correctTopic = msgExt.getProperty(MessageConst.PROPERTY_RETRY_TOPIC);
+                    if (correctTopic != null) {
+                        backTopic = correctTopic;
+                    }
+                    /**
+                     * 在存入CommitLog文件之前，如果消息的延迟级别delayTimeLevel大于0，
+                     * 将消息的主题与队列替换为定时任务主题“SCHEDULE_TOPIC_XXXX”，队列ID为延迟级别减1。
+                     * 再次将消息主题、队列存入消息属性，键分别为PROPERTY_REAL_TOPIC、PROPERTY_REAL_QUEUE_ID。
+                     */
+                    if (TopicValidator.RMQ_SYS_SCHEDULE_TOPIC.equals(msgInner.getTopic())) {
+                        this.brokerController.getBrokerStatsManager().incTopicPutNums(msgInner.getTopic());
+                        this.brokerController.getBrokerStatsManager().incTopicPutSize(msgInner.getTopic(), r.getAppendMessageResult().getWroteBytes());
+                        this.brokerController.getBrokerStatsManager().incQueuePutNums(msgInner.getTopic(), msgInner.getQueueId());
+                        this.brokerController.getBrokerStatsManager().incQueuePutSize(msgInner.getTopic(), msgInner.getQueueId(), r.getAppendMessageResult().getWroteBytes());
+                    }
+                    this.brokerController.getBrokerStatsManager().incSendBackNums(requestHeader.getGroup(), backTopic);
+                    response.setCode(ResponseCode.SUCCESS);
+                    response.setRemark(null);
+                    return response;
+                default:
+                    break;
+            }
+            response.setCode(ResponseCode.SYSTEM_ERROR);
+            response.setRemark(r.getPutMessageStatus().name());
+            return response;
+        }
+        response.setCode(ResponseCode.SYSTEM_ERROR);
+        response.setRemark("putMessageResult is null");
+        return response;
+    });
+}
+```
 
 ##### 3.2 顺序消费
 
