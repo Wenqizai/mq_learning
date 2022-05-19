@@ -2005,6 +2005,8 @@ private CompletableFuture<RemotingCommand> asyncConsumerSendMsgBack(ChannelHandl
 
 ##### 3.2 顺序消费
 
+待定。。。。
+
 ##### 3.3 消费进度
 
 广播模式：同一Consume Group下的所有consumer都需要消费消息。因此消费进度应该是每个consumer独立保存的。
@@ -2176,7 +2178,7 @@ if (mq.getTopic().equals(topic)) {
 >
 > 同一个消息队列只会分配给一个消费者：通过对队列和消费者实例id排序实现，保证每个消费者实例看到的分配的视图都是一致的，所以分配时才能保证同一个队列分配给同一个消费者。假如consumer 1被consumer 2分配了新的队列Entry 5和Entry 6，consumer 1会在负载均衡最后对比一下已负载均衡分配的队列和同步的队列，发现有新的队列就创建`pullRequest`提交到`pullRequestQueue`。
 
-#### 5.消息拉取与消费进度
+#### 5. 消息拉取与消费进度
 
 消费拉取线程定时从broker拉取消息，保存到本地`ProcessQueue`中，存储结构`TreeMap<Long /*偏移量*/, MessageExt /*消息*/> msgTreeMap = new TreeMap<Long, MessageExt>();`。然后提交到消费者线程池处理。消费者线程池每处理完一个消息消费任务（`ConsumeRequest`），会从`ProcessQueue`中移除本批消费的消息，并返回`ProcessQueue`中最小的偏移量，用该偏移量更新消息队列消费进度，也就是说==更新消费进度与消费任务中的消息没有关系==。
 
@@ -2233,6 +2235,191 @@ public long removeMessage(final List<MessageExt> msgs) {
     return result;
 }
 ```
+
+#### 6. 定时消息
+
+定时消息实现类：`ScheduleMessageService`
+
+1. 加载 load()
+
+`org.apache.rocketmq.store.schedule.ScheduleMessageService#load`
+
+该方法主要完成延迟消息**消费队列消息进度的加载**与**`delayLevelTable`数据的构造**，延迟队列消息消费进度默认存储路径为`${ROCKET_HOME}/store/config/delayOffset.json`。
+
+2. 启动 start()
+
+Broker启动时触发此方法：`org.apache.rocketmq.store.schedule.ScheduleMessageService#start`
+
+该方法主要是遍历所有的延时级别，创建定时任务线程池，并执行定时任务。第一次启动时，默认延迟1 s后执行一次定时任务，从第二次调度开始，才使用相应的延迟时间执行定时任务。
+
+**设计关键点：**
+
+1. 定时消息单独一个主题：`SCHEDULE_TOPIC_XXXX`，该主题下的队列数量等于`MessageStoreConfig#messageDelayLevel`配置的延迟级别，其对应关系为`queueId`等于延迟级别减1。(`queueId = delayLevel - 1`)
+2. `ScheduleMessageService`为每个延迟级别创建一个定时器，根据延迟级别对应的延迟时间进行延迟调度。
+3. 在消息发送时，如果消息的延迟级别`delayLevel`大于0，将消息的原主题名称、队列ID存入消息属性，然后改变消息的主题、队列与延迟主题所属队列，消息将最终转发到延迟队列的消费队列中。
+
+```java
+public void start() {
+    if (started.compareAndSet(false, true)) {
+        super.load();
+        this.deliverExecutorService = new ScheduledThreadPoolExecutor(this.maxDelayLevel, new ThreadFactoryImpl("ScheduleMessageTimerThread_"));
+        if (this.enableAsyncDeliver) {
+            this.handleExecutorService = new ScheduledThreadPoolExecutor(this.maxDelayLevel, new ThreadFactoryImpl("ScheduleMessageExecutorHandleThread_"));
+        }
+        // 遍历所有延时级别
+        // ConcurrentMap<Integer /* level */, Long/* delay timeMillis */> delayLevelTable = new ConcurrentHashMap<Integer, Long>(32);
+        for (Map.Entry<Integer, Long> entry : this.delayLevelTable.entrySet()) {
+            Integer level = entry.getKey();
+            Long timeDelay = entry.getValue();
+            // offsetTable 保存消费进度
+            // ConcurrentMap<Integer /* level */, Long/* offset */> offsetTable = new ConcurrentHashMap<Integer, Long>(32);
+            Long offset = this.offsetTable.get(level);
+            if (null == offset) {
+                offset = 0L;
+            }
+		   // 创建定时任务
+            if (timeDelay != null) {
+                if (this.enableAsyncDeliver) {
+                    this.handleExecutorService.schedule(new HandlePutResultTask(level), FIRST_DELAY_TIME, TimeUnit.MILLISECONDS);
+                }
+                // 执行延时任务，时间信息保存在DeliverDelayedMessageTimerTask
+                this.deliverExecutorService.schedule(new DeliverDelayedMessageTimerTask(level, offset), FIRST_DELAY_TIME, TimeUnit.MILLISECONDS);
+            }
+        }
+	    // 每10s持久化一次线程池，通过flushDelayOffsetInterval配置
+        this.deliverExecutorService.scheduleAtFixedRate(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    if (started.get()) {
+                        ScheduleMessageService.this.persist();
+                    }
+                } catch (Throwable e) {
+                    log.error("scheduleAtFixedRate flush exception", e);
+                }
+            }
+        }, 10000, this.defaultMessageStore.getMessageStoreConfig().getFlushDelayOffsetInterval(), TimeUnit.MILLISECONDS);
+    }
+}
+```
+
+3. 定时调度逻辑
+
+定时调度的核心类：`DeliverDelayedMessageTimerTask`
+
+`org.apache.rocketmq.store.schedule.ScheduleMessageService.DeliverDelayedMessageTimerTask#executeOnTimeup`
+
+**设计关键点：**
+
+消息存储时，如果消息的延迟级别属性`delayLevel > 0`，则会备份原主题、原队列到消息属性中，其键分别为PROPERTY_REAL_TOPIC、PROPERTY_REAL_QUEUE_ID，通过为不同的延迟级别创建不同的调度任务，到达延迟时间后执行调度任务。
+
+调度任务主要是根据延迟拉取消息消费进度从延迟队列中拉取消息，然后从`CommitLog`文件中加载完整消息，清除延迟级别属性并恢复原先的主题、队列，再次创建一条新的消息存入`CommitLog`文件并转发到消息消费队列中供消息消费者消费。
+
+```java
+public void executeOnTimeup() {
+    // 根据delayLevel查找对应的消费队列
+    // 如果未找到，说明当前不存在该延时级别的消息，则忽略本次任务，根据延时级别创建下一次调度任务
+    ConsumeQueue cq = ScheduleMessageService.this.defaultMessageStore.findConsumeQueue(TopicValidator.RMQ_SYS_SCHEDULE_TOPIC, delayLevel2QueueId(delayLevel));
+    if (cq == null) {
+        this.scheduleNextTimerTask(this.offset, DELAY_FOR_A_WHILE);
+        return;
+    }
+
+    // 根据offset从消费队列cq中，获取消息
+    // 如果未找到，则更新延迟队列的定时任务消费进度resetOffset，根据延时级别创建下一次调度任务
+    SelectMappedBufferResult bufferCQ = cq.getIndexBuffer(this.offset);
+    if (bufferCQ == null) {
+        long resetOffset;
+        if ((resetOffset = cq.getMinOffsetInQueue()) > this.offset) {
+            log.error("schedule CQ offset invalid. offset={}, cqMinOffset={}, queueId={}", this.offset, resetOffset, cq.getQueueId());
+        } else if ((resetOffset = cq.getMaxOffsetInQueue()) < this.offset) {
+            log.error("schedule CQ offset invalid. offset={}, cqMaxOffset={}, queueId={}", this.offset, resetOffset, cq.getQueueId());
+        } else {
+            resetOffset = this.offset;
+        }
+        this.scheduleNextTimerTask(resetOffset, DELAY_FOR_A_WHILE);
+        return;
+    }
+
+    long nextOffset = this.offset;
+    try {
+        int i = 0;
+        ConsumeQueueExt.CqExtUnit cqExtUnit = new ConsumeQueueExt.CqExtUnit();
+        for (; i < bufferCQ.getSize() && isStarted(); i += ConsumeQueue.CQ_STORE_UNIT_SIZE) {
+            // 遍历ConsumeQueue文件，每一个标准ConsumeQueue条目为20个字节。
+            // 解析出消息的物理偏移量、消息长度、消息标志的哈希码，为从CommitLog文件加载具体的消息做准备
+            long offsetPy = bufferCQ.getByteBuffer().getLong();
+            int sizePy = bufferCQ.getByteBuffer().getInt();
+            long tagsCode = bufferCQ.getByteBuffer().getLong();
+            if (cq.isExtAddr(tagsCode)) {
+                if (cq.getExt(tagsCode, cqExtUnit)) {
+                    tagsCode = cqExtUnit.getTagsCode();
+                } else {
+                    //can't find ext content.So re compute tags code.
+                    log.error("[BUG] can't find consume queue extend file content!addr={}, offsetPy={}, sizePy={}", tagsCode, offsetPy, sizePy);
+                    long msgStoreTime = defaultMessageStore.getCommitLog().pickupStoreTimestamp(offsetPy, sizePy);
+                    tagsCode = computeDeliverTimestamp(delayLevel, msgStoreTime);
+                }
+            }
+            long now = System.currentTimeMillis();
+            long deliverTimestamp = this.correctDeliverTimestamp(now, tagsCode);
+            nextOffset = offset + (i / ConsumeQueue.CQ_STORE_UNIT_SIZE);
+            long countdown = deliverTimestamp - now;
+            if (countdown > 0) {
+                this.scheduleNextTimerTask(nextOffset, DELAY_FOR_A_WHILE);
+                return;
+            }
+
+            // 根据消息物理偏移量与消息大小从CommitLog文件中查找消息。
+            MessageExt msgExt = ScheduleMessageService.this.defaultMessageStore.lookMessageByOffset(offsetPy, sizePy);
+            if (msgExt == null) {
+                continue;
+            }
+            
+		   // 根据消息属性重新构建新的消息对象，清除消息的延迟级别属性（delayLevel）
+            // 恢复消息原先的消息主题与消息消费队列，消息的消费次数reconsumeTimes并不会丢失
+            MessageExtBrokerInner msgInner = ScheduleMessageService.this.messageTimeup(msgExt);
+            if (TopicValidator.RMQ_SYS_TRANS_HALF_TOPIC.equals(msgInner.getTopic())) {
+                log.error("[BUG] the real topic of schedule msg is {}, discard the msg. msg={}", msgInner.getTopic(), msgInner);
+                continue;
+            }
+
+            // 将消息再次存入CommitLog文件，并转发到主题对应的消息队列上，供消费者再次消费。
+            // 存储成功后，更新延迟队列的拉取进度。
+            boolean deliverSuc;
+            if (ScheduleMessageService.this.enableAsyncDeliver) {
+                deliverSuc = this.asyncDeliver(msgInner, msgExt.getMsgId(), offset, offsetPy, sizePy);
+            } else {
+                deliverSuc = this.syncDeliver(msgInner, msgExt.getMsgId(), offset, offsetPy, sizePy);
+            }
+
+            if (!deliverSuc) {
+                this.scheduleNextTimerTask(nextOffset, DELAY_FOR_A_WHILE);
+                return;
+            }
+        }
+
+        nextOffset = this.offset + (i / ConsumeQueue.CQ_STORE_UNIT_SIZE);
+    } catch (Exception e) {
+        log.error("ScheduleMessageService, messageTimeup execute error, offset = {}", nextOffset, e);
+    } finally {
+        bufferCQ.release();
+    }
+
+    this.scheduleNextTimerTask(nextOffset, DELAY_FOR_A_WHILE);
+}
+```
+
+###### 6.1 完整流程
+
+<img src="../../../../resources/pic/schedule-msg.png" alt="schedule-msg" style="zoom: 80%;" />
+
+1. 发送消息的`delayLevel`大于0，则将消息主题变更为`SCHEDULE_TOPIC_XXXX`，消息队列为`delayLevel`减1。（`org.apache.rocketmq.store.CommitLog#asyncPutMessage`）；
+2. 消息经由`CommitLog`文件转发到消息队列`SCHEDULE_TOPIC_XXXX`中；（根据Topic转发到每一个consume queue：`org.apache.rocketmq.store.DefaultMessageStore.CommitLogDispatcherBuildConsumeQueue#dispatch`）
+3. 定时任务Time每隔`1s`根据上次拉取偏移量从消费队列中取出所有消息；
+4. 根据消息的物理偏移量与消息大小从`CommitLog`文件中拉取消息。
+5. 根据消息属性重新创建消息，恢复原主题`topicA`、原队列ID，清除`delayLevel`属性，并存入`CommitLog`文件。
+6. 将消息转发到原主题`topicA`的消息消费队列，供消息消费者消费。
 
 # 思考点
 
