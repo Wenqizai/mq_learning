@@ -1247,7 +1247,7 @@ Supplier<String> msgIdSupplier = () -> {
 
 #### consumequeue
 
-![commitlog](../../../../resources/pic/consumequeue-file.png)
+![consumequeue](../../../../resources/pic/consumequeue-file.png)
 
 consumequeue消息条目固定20字节，并提供index来快速定位消息条目，提高读性能。同时，由于每个消息固定20字节，就可以利用逻辑偏移计算来定位条目，无需再遍历整个consumequeue文件。
 
@@ -2420,6 +2420,92 @@ public void executeOnTimeup() {
 4. 根据消息的物理偏移量与消息大小从`CommitLog`文件中拉取消息。
 5. 根据消息属性重新创建消息，恢复原主题`topicA`、原队列ID，清除`delayLevel`属性，并存入`CommitLog`文件。
 6. 将消息转发到原主题`topicA`的消息消费队列，供消息消费者消费。
+
+#### 7. 消息过滤
+
+![consumequeue](README.assets/consumequeue-file-16530148326022.png)
+
+> 过滤机制
+
+`RocketMQ`消息过滤方式是在订阅时进行过滤。
+
+Producer在消息发送时如果设置了消息的标志属性Tag，便会存储在消息属性中，将其从`CommitLog`文件转发到消息消费队列中，consume queue会用8个字节存储Tag哈希码。（不直接存储字符串，是因为将`ConumeQueue`设计为定长结构，以加快消息消费的加载性能。）
+
+1. Broker端拉取消息时，遍历`ConsumeQueue`，只对比Tag哈希码，如果匹配则返回，否则忽略该消息。
+2. Consumer在收到消息后，同样需要先对消息进行过滤，**只是此时比较的是消息标志的值而不是哈希码。**(哈希冲突)
+
+> 源码
+
+1. consumer启动订阅时，构造订阅信息，包括订阅Topic与消息过滤表达式。
+
+`org.apache.rocketmq.client.impl.consumer.DefaultMQPushConsumerImpl#subscribe(java.lang.String, java.lang.String)`
+
+2. 拉取消息时，获取订阅时构造的订阅信息，并向Broker发起pull Message请求。
+
+`org.apache.rocketmq.client.impl.consumer.DefaultMQPushConsumerImpl#pullMessage`
+
+```java
+public void pullMessage(final PullRequest pullRequest) {
+    // 获取订阅信息subscriptionData
+    final SubscriptionData subscriptionData = this.rebalanceImpl.getSubscriptionInner().get(pullRequest.getMessageQueue().getTopic());
+    
+    String subExpression = null;
+    boolean classFilter = false;
+    SubscriptionData sd = this.rebalanceImpl.getSubscriptionInner().get(pullRequest.getMessageQueue().getTopic());
+    if (sd != null) {
+        if (this.defaultMQPushConsumer.isPostSubscriptionWhenPull() && !sd.isClassFilterMode()) {
+            subExpression = sd.getSubString();
+        }
+        classFilter = sd.isClassFilterMode();
+    }
+
+    int sysFlag = PullSysFlag.buildSysFlag(
+        commitOffsetEnable, // commitOffset
+        true, // suspend
+        subExpression != null, // subscription
+        classFilter // class filter
+    );
+    try {
+        this.pullAPIWrapper.pullKernelImpl(
+            pullRequest.getMessageQueue(),
+            subExpression,
+            subscriptionData.getExpressionType(),
+            subscriptionData.getSubVersion(),
+            pullRequest.getNextOffset(),
+            this.defaultMQPushConsumer.getPullBatchSize(),
+            sysFlag,
+            commitOffsetValue,
+            BROKER_SUSPEND_MAX_TIME_MILLIS,
+            CONSUMER_TIMEOUT_MILLIS_WHEN_SUSPEND,
+            CommunicationMode.ASYNC,
+            pullCallback
+        );
+    } catch (Exception e) {
+        log.error("pullKernelImpl exception", e);
+        this.executePullRequestLater(pullRequest, pullTimeDelayMillsWhenException);
+    }
+}
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 # 思考点
 
