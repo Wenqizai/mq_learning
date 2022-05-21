@@ -699,7 +699,7 @@ public void start() throws MQClientException {
 
 ==注：Broker的路由信息是持久化的，NameServer的路由信息是在内存中。==
 
-![](../../../../resources/pic/find-topic.png)
+![](https://s2.loli.net/2022/05/21/ZBaA4bxJfTWltuI.png)
 
 #### Send
 
@@ -720,7 +720,7 @@ public void start() throws MQClientException {
 
   consumequeue作为消费消息的索引，保存指定topic下队列消息在commitlog中的其实偏移量（offset），消息大小（size）和消息Tag的哈希码。Tag过滤会用到。
 
-<img src="../../../../resources/pic/consumequeue-struct.png" style="zoom:50%;" />
+<img src="https://s2.loli.net/2022/05/21/loqxWR4i3LVEdC6.png" style="zoom:50%;" />
 
 - ReputMessageService ThreadLoop
 
@@ -762,7 +762,7 @@ public void start() throws MQClientException {
 
   更新消费速度，发送给Broker
 
-![send-msg](../../../../resources/pic/send-msg.png)
+![send-msg](https://s2.loli.net/2022/05/21/5HPRxTKfnlVm7ws.png)
 
 ##### 发送同步消息SYNC
 
@@ -936,7 +936,7 @@ public interface MQProducer extends MQAdmin {}
 
 Producer从NameServer中拉取到的路由信息如下图：
 
-从图中messageQueueList可以看出，其保存的是所有的broker的队列信息，然后轮询选择队列。因此sendMessage的负载均衡是队列的轮询而不是broker下的队列轮询。`org.apache.rocketmq.client.latency.MQFaultStrategy#selectOneMessageQueue`![topicPublishInfo](../../../../resources/pic/topicPublishInfo.png)
+从图中messageQueueList可以看出，其保存的是所有的broker的队列信息，然后轮询选择队列。因此sendMessage的负载均衡是队列的轮询而不是broker下的队列轮询。`org.apache.rocketmq.client.latency.MQFaultStrategy#selectOneMessageQueue`![topicPublishInfo](https://s2.loli.net/2022/05/21/NykHYMR3ejCEPo6.png)
 
 ##### Broker故障规避机制
 
@@ -1124,7 +1124,7 @@ public interface LatencyFaultTolerance<T> {
 
 ## Message
 
-![image-20220407144921030](../../../../resources/pic/message-struct.png)
+![image-20220407144921030](https://s2.loli.net/2022/05/21/fsv4nRyVL8Opd2P.png)
 
 | 字段           | 用途                                 |
 | -------------- | ------------------------------------ |
@@ -1152,7 +1152,7 @@ public interface LatencyFaultTolerance<T> {
 
 ## 消息存储
 
-![消息处理流程](../../../../resources/pic/msg-handle.png)
+![消息处理流程](https://s2.loli.net/2022/05/21/i6O1RacIAqCBjmM.png)
 
 #### 存储流程
 
@@ -1220,14 +1220,14 @@ Supplier<String> msgIdSupplier = () -> {
 
 #### commitlog
 
-![commitlog](../../../../resources/pic/commitlog-file.png)
+![commitlog](https://s2.loli.net/2022/05/21/hlnHvtbKS5i86ps.png)
 
 commitlog的消息写入是顺序写入，一旦写入不允许修改（极致利用磁盘顺序写特性），命名是以偏移量来命名，如第一个CommitLog文件为0000000000000000000，第二个CommitLog文件为00000000001073741824，依次类推。
 
 1个commitlog文件大小是1G，第二个文件的开始偏移是1G = 1024 * 1024 * 1024B = 1073741824
 
 ##### Message ID
-![msgid](../../../../resources/pic/msgid.png)
+![msgid](https://s2.loli.net/2022/05/21/ZBRtP6eofASbMld.png)
 
 全局唯一消息ID，共16字节。
 
@@ -1247,12 +1247,12 @@ Supplier<String> msgIdSupplier = () -> {
 
 #### consumequeue
 
-![consumequeue](../../../../resources/pic/consumequeue-file.png)
+![consumequeue](![](https://s2.loli.net/2022/05/21/46Hznx1b5Xv2GoA.png)
 
 consumequeue消息条目固定20字节，并提供index来快速定位消息条目，提高读性能。同时，由于每个消息固定20字节，就可以利用逻辑偏移计算来定位条目，无需再遍历整个consumequeue文件。
 
 #### index
-<img src="../../../../resources/pic/index-file.png" alt="commitlog"  />
+<img src="https://s2.loli.net/2022/05/21/ANwltXVobpcExP1.png" alt="commitlog"  />
 
 > Header
 
@@ -1290,7 +1290,7 @@ consumequeue消息条目固定20字节，并提供index来快速定位消息条�
 
 checkpoint用来记录commitlog，consumeQueue，Index文件刷盘时间点。
 
-![checkpoint](../../../../resources/pic/checkpoint.png)
+![checkpoint](https://s2.loli.net/2022/05/21/eFIVvd86RHgcsrb.png)
 
 - PhysicMsgTimestamp：commitlog文件刷盘时间点
 - LogicsMsgTimestamp：consumequeue文件刷盘时间点
@@ -1321,11 +1321,11 @@ boolean manualDelete = this.manualDeleteFileSeveralTimes > 0;
 
 - 消费者拉取消息模式
 
-![consumer-pull-msg](../../../../resources/pic/consumer-pull-msg.png)
+![consumer-pull-msg](https://s2.loli.net/2022/05/21/mBbYuozKRxgM64G.png)
 
 - 消费进度反馈机制
 
-![消费进度反馈机制](../../../../resources/pic/消费进度反馈机制.png)
+![消费进度反馈机制](https://s2.loli.net/2022/05/21/86KTBzUeR9Cqpjr.png)
 
 > 关于消费进度提交机制的思考?
 
@@ -2131,11 +2131,11 @@ private void rebalanceByTopic(final String topic, final boolean isOrder) {
 
 5. 移除负载均衡队列中的无用的队列，将新的队列创建一个新的`PullRequest`加入到消息拉取线程中`PullMessageService`。`org.apache.rocketmq.client.impl.consumer.RebalanceImpl#updateProcessQueueTableInRebalance`
 
-![consumer的负载均衡](README.assets/consumer%E7%9A%84%E8%B4%9F%E8%BD%BD%E5%9D%87%E8%A1%A1.png)
+![consumer的负载均衡](https://s2.loli.net/2022/05/21/dMvFqprKl6EtnbI.png)
 
 整体流程图
 
-![](README.assets/PullMessageService%E7%BA%BF%E7%A8%8B%E4%B8%8ERebalanceService%E7%BA%BF%E7%A8%8B%E4%BA%A4%E4%BA%92.png)
+![](https://s2.loli.net/2022/05/21/bBm6nqrRIXx3DVZ.png)
 
 6. 在进行消息负载时，如果消息消费队列被分配给其他消费者，会将该`ProcessQueue`状态设置为`droped`，持久化该消息队列的消费进度，并从内存中将其移除。
 
@@ -2412,7 +2412,7 @@ public void executeOnTimeup() {
 
 ###### 6.1 完整流程
 
-<img src="../../../../resources/pic/schedule-msg.png" alt="schedule-msg" style="zoom: 80%;" />
+<img src="https://s2.loli.net/2022/05/21/4H5jGWFyxSvPRKD.png" alt="schedule-msg" style="zoom: 80%;" />
 
 1. 发送消息的`delayLevel`大于0，则将消息主题变更为`SCHEDULE_TOPIC_XXXX`，消息队列为`delayLevel`减1。（`org.apache.rocketmq.store.CommitLog#asyncPutMessage`）；
 2. 消息经由`CommitLog`文件转发到消息队列`SCHEDULE_TOPIC_XXXX`中；（根据Topic转发到每一个consume queue：`org.apache.rocketmq.store.DefaultMessageStore.CommitLogDispatcherBuildConsumeQueue#dispatch`）
@@ -2423,7 +2423,7 @@ public void executeOnTimeup() {
 
 #### 7. 消息过滤
 
-![consumequeue](README.assets/consumequeue-file-16530148326022.png)
+![consumequeue](https://s2.loli.net/2022/05/21/46Hznx1b5Xv2GoA.png)
 
 > 过滤机制
 
@@ -2434,7 +2434,7 @@ Producer在消息发送时如果设置了消息的标志属性Tag，便会存储
 1. Broker端拉取消息时，遍历`ConsumeQueue`，只对比Tag哈希码，如果匹配则返回，否则忽略该消息。
 2. Consumer在收到消息后，同样需要先对消息进行过滤，**只是此时比较的是消息标志的值而不是哈希码。**(哈希冲突)
 
-> 源码
+##### 7.1 过滤流程
 
 1. consumer启动订阅时，构造订阅信息，包括订阅Topic与消息过滤表达式。
 
@@ -2453,18 +2453,22 @@ public void pullMessage(final PullRequest pullRequest) {
     boolean classFilter = false;
     SubscriptionData sd = this.rebalanceImpl.getSubscriptionInner().get(pullRequest.getMessageQueue().getTopic());
     if (sd != null) {
+        // 是否是class过滤
         if (this.defaultMQPushConsumer.isPostSubscriptionWhenPull() && !sd.isClassFilterMode()) {
+            // subExpression为Tag表达式
             subExpression = sd.getSubString();
         }
+        // clase过滤模式
         classFilter = sd.isClassFilterMode();
     }
-
+		// 系统标志
     int sysFlag = PullSysFlag.buildSysFlag(
         commitOffsetEnable, // commitOffset
         true, // suspend
         subExpression != null, // subscription
         classFilter // class filter
     );
+    // 向Broker发送拉取消息请求
     try {
         this.pullAPIWrapper.pullKernelImpl(
             pullRequest.getMessageQueue(),
@@ -2487,25 +2491,142 @@ public void pullMessage(final PullRequest pullRequest) {
 }
 ```
 
+3. Broker处理拉取消息请求
 
+Broker封装过滤对象：`org.apache.rocketmq.broker.processor.PullMessageProcessor#processRequest(io.netty.channel.Channel, org.apache.rocketmq.remoting.protocol.RemotingCommand, boolean)`
 
+```java
+private RemotingCommand processRequest(final Channel channel, RemotingCommand request, boolean brokerAllowSuspend) throws RemotingCommandException {
+  // 构造过滤器
+  MessageFilter messageFilter;
+  if (this.brokerController.getBrokerConfig().isFilterSupportRetry()) {
+    // 支持对重试主题的过滤
+    messageFilter = new ExpressionForRetryMessageFilter(subscriptionData, consumerFilterData, this.brokerController.getConsumerFilterManager());
+  } else {
+    // 不支持对重试主题的过滤
+    messageFilter = new ExpressionMessageFilter(subscriptionData, consumerFilterData, this.brokerController.getConsumerFilterManager());
+  }
+  // 由过滤器来获取消息
+  final GetMessageResult getMessageResult = this.brokerController.getMessageStore().getMessage(requestHeader.getConsumerGroup(), requestHeader.getTopic(),
+                                                       requestHeader.getQueueId(), requestHeader.getQueueOffset(), requestHeader.getMaxMsgNums(), messageFilter);
+}
+```
 
+获取消息并执行过滤：`org.apache.rocketmq.store.DefaultMessageStore#getMessage`
 
+```java
+public GetMessageResult getMessage(final String group, final String topic, final int queueId, final long offset, final int maxMsgNums, final MessageFilter messageFilter) {
+  // 根据偏移量拉取消息后，首先根据ConsumeQueue条目进行消息过滤，如果不匹配则直接跳过该条消息，继续拉取下一条消息
+  if (messageFilter != null
+       && !messageFilter.isMatchedByConsumeQueue(isTagsCodeLegal ? tagsCode : null, extRet ? cqExtUnit : null)) {
+     if (getResult.getBufferTotalSize() == 0) {
+       status = GetMessageStatus.NO_MATCHED_MESSAGE;
+     }
 
+     continue;
+   }
+  // 上面ConsumeQueue条目过滤符合条件
+  // 下面需要从CommitLog文件中加载整个消息体，然后根据属性进行过滤。当然如果过滤方式是TAG模式，该方法默认返回true
+  SelectMappedBufferResult selectResult = this.commitLog.getMessage(offsetPy, sizePy);
+  if (null == selectResult) {
+    if (getResult.getBufferTotalSize() == 0) {
+      status = GetMessageStatus.MESSAGE_WAS_REMOVING;
+    }
+    nextPhyFileStartOffset = this.commitLog.rollNextFile(offsetPy);
+    continue;
+  }
 
+  if (messageFilter != null
+      && !messageFilter.isMatchedByCommitLog(selectResult.getByteBuffer().slice(), null)) {
+    if (getResult.getBufferTotalSize() == 0) {
+      status = GetMessageStatus.NO_MATCHED_MESSAGE;
+    }
+    // release...
+    selectResult.release();
+    continue;
+  }
+```
 
+4. 拉取消息客户端在回调方法（`PullCallback`）里面处理拉取的消息
 
+`org.apache.rocketmq.client.impl.consumer.PullAPIWrapper#processPullResult`
 
+```java
+public PullResult processPullResult(final MessageQueue mq, final PullResult pullResult, final SubscriptionData subscriptionData) {
+  List<MessageExt> msgListFilterAgain = msgList;
+  if (!subscriptionData.getTagsSet().isEmpty() && !subscriptionData.isClassFilterMode()) {
+    msgListFilterAgain = new ArrayList<MessageExt>(msgList.size());
+    for (MessageExt msg : msgList) {
+      if (msg.getTags() != null) {
+        // 这里对比Tag真实值不是hashcode
+        if (subscriptionData.getTagsSet().contains(msg.getTags())) {
+          msgListFilterAgain.add(msg);
+        }
+      }
+    }
+}
+```
 
+过滤对象关系图
 
+<img src="https://s2.loli.net/2022/05/21/skBEtroDPHqU9Nw.png" alt="image-20220521170917368" style="zoom:33%;" />
 
+##### 7.2 过滤机制
 
+`ExpressionMessageFilter#isMatchedByConsumeQueue`
 
+```java
+public boolean isMatchedByConsumeQueue(Long tagsCode, ConsumeQueueExt.CqExtUnit cqExtUnit) {
+  // 订阅信息为空
+  if (null == subscriptionData) {
+    return true;
+  }
+	// 类过滤模式
+  if (subscriptionData.isClassFilterMode()) {
+    return true;
+  }
 
+  // by tags code.
+  if (ExpressionType.isTagType(subscriptionData.getExpressionType())) {
+		// 息在发送时没有设置tag
+    if (tagsCode == null) {
+      return true;
+    }
+		// Tag设置为*
+    if (subscriptionData.getSubString().equals(SubscriptionData.SUB_ALL)) {
+      return true;
+    }
+		// 订阅消息的TAG hashcodes集合是否包含消息的tagsCode
+    return subscriptionData.getCodeSet().contains(tagsCode.intValue());
+  }
+  return true;
+}
+```
 
+`ExpressionMessageFilter#isMatchedByCommitLog`
 
+```java
+public boolean isMatchedByCommitLog(ByteBuffer msgBuffer, Map<String, String> properties) {
+  // 订阅信息为空
+  if (subscriptionData == null) {
+    return true;
+  }
+  // 类过滤模式
+  if (subscriptionData.isClassFilterMode()) {
+    return true;
+  }
+	// Tag过滤模式
+  if (ExpressionType.isTagType(subscriptionData.getExpressionType())) {
+    return true;
+  }
+}
+```
 
+关于`ExpressionForRetryMessageFilter`：
 
+`ExpressionForRetryMessageFilter`继承了`ExpressionMessageFilter`，并仅仅重写了`isMatchedByCommitLog`方法。里面使用`subscriptionData.getTopic().startsWith(MixAll.RETRY_GROUP_TOPIC_PREFIX`)来判断是否是`isRetryTopic`；
+
+对于`retryTopic`会使用`tempProperties.get(MessageConst.PROPERTY_RETRY_TOPIC)`来获取`realTopic`，从而根据`consumerFilterManager.get(realTopic, group)`获取`realFilterData`；最后通过`realFilterData.getCompiledExpression().evaluate(context)`来获取结果。
 
 # 思考点
 
