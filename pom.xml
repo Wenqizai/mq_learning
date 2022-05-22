@@ -28,6 +28,11 @@
             <artifactId>rocketmq-client</artifactId>
             <version>4.9.4-SNAPSHOT</version>
         </dependency>
+        <dependency>
+            <groupId>org.apache.rocketmq</groupId>
+            <artifactId>rocketmq-acl</artifactId>
+            <version>4.9.4-SNAPSHOT</version>
+        </dependency>
         <!-- 方便等会写单元测试 -->
         <dependency>
             <groupId>org.springframework.boot</groupId>
