@@ -55,6 +55,10 @@ Tag 和 Key 的主要差别是使用场景不同，Tag 用在 Consumer 代码中
 1. 广播模式：消息发送到所有的consumer group下的所有的consumer实例。
 2. 集群模式：消息发送到所有consumer group下的其中某一个consumer实例。
 
+Consume Queue
+
+集群模式下同一个消费组内的消费者共同承担其订阅主题下消息队列的消费，==同一个消息消费队列在同一时刻只会被消费组内的一个消费者消费，一个消费者同一时刻可以分配多个消费队列。==
+
 # Quick Start
 
 ### Producer(普通消息)
@@ -2003,11 +2007,7 @@ private CompletableFuture<RemotingCommand> asyncConsumerSendMsgBack(ChannelHandl
 }
 ```
 
-##### 3.2 顺序消费
-
-待定。。。。
-
-##### 3.3 消费进度
+##### 3.2 消费进度
 
 广播模式：同一Consume Group下的所有consumer都需要消费消息。因此消费进度应该是每个consumer独立保存的。
 
@@ -2627,6 +2627,298 @@ public boolean isMatchedByCommitLog(ByteBuffer msgBuffer, Map<String, String> pr
 `ExpressionForRetryMessageFilter`继承了`ExpressionMessageFilter`，并仅仅重写了`isMatchedByCommitLog`方法。里面使用`subscriptionData.getTopic().startsWith(MixAll.RETRY_GROUP_TOPIC_PREFIX`)来判断是否是`isRetryTopic`；
 
 对于`retryTopic`会使用`tempProperties.get(MessageConst.PROPERTY_RETRY_TOPIC)`来获取`realTopic`，从而根据`consumerFilterManager.get(realTopic, group)`获取`realFilterData`；最后通过`realFilterData.getCompiledExpression().evaluate(context)`来获取结果。
+
+#### 8. 顺序消息
+
+##### 8.1 负载均衡
+
+`org.apache.rocketmq.client.impl.consumer.RebalanceImpl#updateProcessQueueTableInRebalance`
+
+经过消息队列重新负载（分配）后，分配到新的消息队列时，首先需要尝试向Broker发起锁定该消息队列的请求，如果返回加锁成功，则创建该消息队列的拉取任务，否则跳过，等待其他消费者释放
+该消息队列的锁，然后在下一次队列重新负载时再尝试加锁。
+
+顺序消息消费与并发消息消费的一个关键区别是，**顺序消息在创建消息队列拉取任务时，需要在Broker服务器锁定该消息队列**。
+
+```java
+// 检查负载均衡后的队列与Broker同步的队列
+for (MessageQueue mq : mqSet) {
+  // 在负载均衡队列中没有，而在Broker中有的队列
+  if (!this.processQueueTable.containsKey(mq)) {
+    // isOrder：顺序消费，this.lock：向Broker发送锁定队列的请求
+    if (isOrder && !this.lock(mq)) {
+      // 加锁失败后放弃，等待下次负载均衡加锁
+      log.warn("doRebalance, {}, add a new mq failed, {}, because lock failed", consumerGroup, mq);
+      continue;
+    }
+		// 加锁成功后，进行队列操作和创建新的拉取消息任务pullRequest
+    this.removeDirtyOffset(mq);
+  } 
+}
+this.dispatchPullRequest(pullRequestList);
+```
+
+##### 8.2 消息拉取
+
+`org.apache.rocketmq.client.impl.consumer.DefaultMQPushConsumerImpl#pullMessage`
+
+如果消息处理队列未被锁定，则延迟3 s后再将`PullRequest`对象放入拉取任务中，如果该处理队列是第一次拉取任务，则首先计算拉取偏移量，然后向消息服务端拉取消息。
+
+```java
+if (processQueue.isLocked()) {
+  if (!pullRequest.isPreviouslyLocked()) {
+    long offset = -1L;
+    try {
+      offset = this.rebalanceImpl.computePullFromWhereWithException(pullRequest.getMessageQueue());
+    } catch (Exception e) {
+      this.executePullRequestLater(pullRequest, pullTimeDelayMillsWhenException);
+      return;
+    }
+		// 设置要拉取的偏移量
+    pullRequest.setPreviouslyLocked(true);
+    pullRequest.setNextOffset(offset);
+  }
+} else {
+  // 延迟3s再执行
+  this.executePullRequestLater(pullRequest, pullTimeDelayMillsWhenException);
+  return;
+}
+```
+
+##### 8.3 消息消费
+
+消息消费实现类：`org.apache.rocketmq.client.impl.consumer.ConsumeMessageOrderlyService`
+
+1. start()
+
+`org.apache.rocketmq.client.impl.consumer.ConsumeMessageOrderlyService#start`
+
+20s的加锁频率与消息进行一次负载均衡的频率相同。我们知道集群模式下顺序消息消费再队列列锁定的情况下，才会
+创建拉取任务，即`ProcessQueue.locked == true`。
+
+在未锁定消息队列时无法执行消息拉取任务，`ConsumeMessageOrderlyService`以20s的频率对分配给自己的消息队列进行自动加锁操作，从而让加锁成功的队列进行消息拉取，并提交消费。
+
+```java
+public void start() {
+  if (MessageModel.CLUSTERING.equals(ConsumeMessageOrderlyService.this.defaultMQPushConsumerImpl.messageModel())) {
+    this.scheduledExecutorService.scheduleAtFixedRate(new Runnable() {
+      @Override
+      public void run() {
+        try {
+          // 集群模式下每20描执行一次，本地消息队列锁定
+          ConsumeMessageOrderlyService.this.lockMQPeriodically();
+        } catch (Throwable e) {
+          log.error("scheduleAtFixedRate lockMQPeriodically exception", e);
+        }
+      }
+      // ProcessQueue.REBALANCE_LOCK_INTERVAL = 20000
+    }, 1000 * 1, ProcessQueue.REBALANCE_LOCK_INTERVAL, TimeUnit.MILLISECONDS);
+  }
+}
+```
+
+2. 加锁
+
+`org.apache.rocketmq.client.impl.consumer.RebalanceImpl#lockAll`
+
+```java
+public void lockAll() {
+  // 根据BrokerName获取相应的队列
+  HashMap<String, Set<MessageQueue>> brokerMqs = this.buildProcessQueueTableByBrokerName();
+
+  Iterator<Entry<String, Set<MessageQueue>>> it = brokerMqs.entrySet().iterator();
+  while (it.hasNext()) {
+    Entry<String, Set<MessageQueue>> entry = it.next();
+    final String brokerName = entry.getKey();
+    final Set<MessageQueue> mqs = entry.getValue();
+
+    if (mqs.isEmpty())
+      continue;
+		// 获取消费者订阅Broker主节点地址
+    FindBrokerResult findBrokerResult = this.mQClientFactory.findBrokerAddressInSubscribe(brokerName, MixAll.MASTER_ID, true);
+    if (findBrokerResult != null) {
+      LockBatchRequestBody requestBody = new LockBatchRequestBody();
+      requestBody.setConsumerGroup(this.consumerGroup);
+      requestBody.setClientId(this.mQClientFactory.getClientId());
+      requestBody.setMqSet(mqs);
+
+      try {
+        // 向Mater主节点发起锁定消息队列请求, 返回加锁队列lockOKMQSet
+        Set<MessageQueue> lockOKMQSet =
+          this.mQClientFactory.getMQClientAPIImpl().lockBatchMQ(findBrokerResult.getBrokerAddr(), requestBody, 1000);
+			  // 根据加锁成功的队列lockOKMQSet, 对与本地对应的队列processQueueTable中进行设置锁定状态，同时更新加锁时间
+        for (MessageQueue mq : lockOKMQSet) {
+          ProcessQueue processQueue = this.processQueueTable.get(mq);
+          if (processQueue != null) {
+            if (!processQueue.isLocked()) {
+              log.info("the message queue locked OK, Group: {} {}", this.consumerGroup, mq);
+            }
+
+            processQueue.setLocked(true);
+            processQueue.setLastLockTimestamp(System.currentTimeMillis());
+          }
+        }
+        // 本地队列mqs(即发送锁定请求前的队列)，对于未加锁成功的队列设置锁的状态false，暂停该消息消费队列的消息拉取与消息消费
+        for (MessageQueue mq : mqs) {
+          if (!lockOKMQSet.contains(mq)) {
+            ProcessQueue processQueue = this.processQueueTable.get(mq);
+            if (processQueue != null) {
+              processQueue.setLocked(false);
+              log.warn("the message queue locked Failed, Group: {} {}", this.consumerGroup, mq);
+            }
+          }
+        }
+      } catch (Exception e) {
+        log.error("lockBatchMQ exception, " + mqs, e);
+      }
+    }
+  }
+}
+```
+
+3. 提交消费
+
+`org.apache.rocketmq.client.impl.consumer.ConsumeMessageOrderlyService.ConsumeRequest#run`
+
+```java
+@Override
+public void run() {
+  if (this.processQueue.isDropped()) {
+    return;
+  }
+  // 获取队列锁, 并加锁
+  final Object objLock = messageQueueLock.fetchLockObject(this.messageQueue);
+  synchronized (objLock) {
+    // 广播模式或者执行队列已加锁(20s加锁一次)
+    if (MessageModel.BROADCASTING.equals(ConsumeMessageOrderlyService.this.defaultMQPushConsumerImpl.messageModel())
+        || (this.processQueue.isLocked() && !this.processQueue.isLockExpired())) {
+      final long beginTime = System.currentTimeMillis();
+      for (boolean continueConsume = true; continueConsume; ) {
+        if (this.processQueue.isDropped()) {
+          break;
+        }
+        // 一些前置条件校验，不满足则延迟执行
+        if (MessageModel.CLUSTERING.equals(ConsumeMessageOrderlyService.this.defaultMQPushConsumerImpl.messageModel())
+            && !this.processQueue.isLocked()) {
+          ConsumeMessageOrderlyService.this.tryLockLaterAndReconsume(this.messageQueue, this.processQueue, 10);
+          break;
+        }
+        if (MessageModel.CLUSTERING.equals(ConsumeMessageOrderlyService.this.defaultMQPushConsumerImpl.messageModel())
+            && this.processQueue.isLockExpired()) {
+          ConsumeMessageOrderlyService.this.tryLockLaterAndReconsume(this.messageQueue, this.processQueue, 10);
+          break;
+        }
+        // 时间过长则放弃本次消费
+        long interval = System.currentTimeMillis() - beginTime;
+        if (interval > MAX_TIME_CONSUME_CONTINUOUSLY) {
+          ConsumeMessageOrderlyService.this.submitConsumeRequestLater(processQueue, messageQueue, 10);
+          break;
+        }
+
+        final int consumeBatchSize = ConsumeMessageOrderlyService.this.defaultMQPushConsumer.getConsumeMessageBatchMaxSize();
+        // 从队列中获取消息，区别与并发消费（并发消费是消费刚刚拉取的那一批消息）
+        List<MessageExt> msgs = this.processQueue.takeMessages(consumeBatchSize);
+        defaultMQPushConsumerImpl.resetRetryAndNamespace(msgs, defaultMQPushConsumer.getConsumerGroup());
+        if (!msgs.isEmpty()) {
+          final ConsumeOrderlyContext context = new ConsumeOrderlyContext(this.messageQueue);
+          ConsumeOrderlyStatus status = null;
+          ConsumeMessageContext consumeMessageContext = null;
+          // 钩子函数
+          if (ConsumeMessageOrderlyService.this.defaultMQPushConsumerImpl.hasHook()) {
+            consumeMessageContext = new ConsumeMessageContext();
+            consumeMessageContext.setConsumerGroup(ConsumeMessageOrderlyService.this.defaultMQPushConsumer.getConsumerGroup());
+            consumeMessageContext.setNamespace(defaultMQPushConsumer.getNamespace());
+            consumeMessageContext.setMq(messageQueue);
+            consumeMessageContext.setMsgList(msgs);
+            consumeMessageContext.setSuccess(false);
+            // init the consume context type
+            consumeMessageContext.setProps(new HashMap<String, String>());
+            ConsumeMessageOrderlyService.this.defaultMQPushConsumerImpl.executeHookBefore(consumeMessageContext);
+          }
+
+          long beginTimestamp = System.currentTimeMillis();
+          ConsumeReturnType returnType = ConsumeReturnType.SUCCESS;
+          boolean hasException = false;
+          try {
+            // 申请消息消费锁
+            this.processQueue.getConsumeLock().lock();
+            if (this.processQueue.isDropped()) {
+              break;
+            }
+            // 提交消费
+            status = messageListener.consumeMessage(Collections.unmodifiableList(msgs), context);
+          } catch (Throwable e) {
+            hasException = true;
+          } finally {
+            // 释放锁
+            this.processQueue.getConsumeLock().unlock();
+          }
+
+          if (null == status
+              || ConsumeOrderlyStatus.ROLLBACK == status
+              || ConsumeOrderlyStatus.SUSPEND_CURRENT_QUEUE_A_MOMENT == status) {
+            log.warn("consumeMessage Orderly return not OK, Group: {} Msgs: {} MQ: {}",
+                     ConsumeMessageOrderlyService.this.consumerGroup,
+                     msgs,
+                     messageQueue);
+          }
+
+          long consumeRT = System.currentTimeMillis() - beginTimestamp;
+          if (null == status) {
+            if (hasException) {
+              returnType = ConsumeReturnType.EXCEPTION;
+            } else {
+              returnType = ConsumeReturnType.RETURNNULL;
+            }
+          } else if (consumeRT >= defaultMQPushConsumer.getConsumeTimeout() * 60 * 1000) {
+            returnType = ConsumeReturnType.TIME_OUT;
+          } else if (ConsumeOrderlyStatus.SUSPEND_CURRENT_QUEUE_A_MOMENT == status) {
+            returnType = ConsumeReturnType.FAILED;
+          } else if (ConsumeOrderlyStatus.SUCCESS == status) {
+            returnType = ConsumeReturnType.SUCCESS;
+          }
+
+          if (ConsumeMessageOrderlyService.this.defaultMQPushConsumerImpl.hasHook()) {
+            consumeMessageContext.getProps().put(MixAll.CONSUME_CONTEXT_TYPE, returnType.name());
+          }
+
+          if (null == status) {
+            status = ConsumeOrderlyStatus.SUSPEND_CURRENT_QUEUE_A_MOMENT;
+          }
+          // 钩子函数
+          if (ConsumeMessageOrderlyService.this.defaultMQPushConsumerImpl.hasHook()) {
+            consumeMessageContext.setStatus(status.toString());
+            consumeMessageContext
+              .setSuccess(ConsumeOrderlyStatus.SUCCESS == status || ConsumeOrderlyStatus.COMMIT == status);
+            ConsumeMessageOrderlyService.this.defaultMQPushConsumerImpl.executeHookAfter(consumeMessageContext);
+          }
+
+          ConsumeMessageOrderlyService.this.getConsumerStatsManager().incConsumeRT(ConsumeMessageOrderlyService.this.consumerGroup, messageQueue.getTopic(), consumeRT);
+          // 处理消费结果
+          continueConsume = ConsumeMessageOrderlyService.this.processConsumeResult(msgs, status, context, this);
+        } else {
+          continueConsume = false;
+        }
+      }
+    } else {
+      if (this.processQueue.isDropped()) {
+        return;
+      }
+
+      ConsumeMessageOrderlyService.this.tryLockLaterAndReconsume(this.messageQueue, this.processQueue, 100);
+    }
+  }
+}
+```
+
+
+
+
+
+
+
+
+
+
 
 # 思考点
 
