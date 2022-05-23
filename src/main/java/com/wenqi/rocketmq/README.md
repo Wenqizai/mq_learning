@@ -2910,15 +2910,47 @@ public void run() {
 }
 ```
 
+## ACL
 
+`RocketMQ`中只定义了两种角色，管理员和非管理员，通过用户名和密码进行访问。开启`ACL`功能需要`Broker`端与客户端同时配合。
 
+- Broker端的入口
 
+`org.apache.rocketmq.broker.BrokerController#initialAcl`
 
+```java
+ private void initialAcl() {
+     // broker.conf配置了：aclEnable=true
+     if (!this.brokerConfig.isAclEnable()) {
+         log.info("The broker dose not enable acl");
+         return;
+     }
+    // 加载校验类：AccessValidator
+     List<AccessValidator> accessValidators = ServiceProvider.load(ServiceProvider.ACL_VALIDATOR_ID, AccessValidator.class);
+     if (accessValidators == null || accessValidators.isEmpty()) {
+         log.info("The broker dose not load the AccessValidator");
+         return;
+     }
 
+     for (AccessValidator accessValidator: accessValidators) {
+         final AccessValidator validator = accessValidator;
+         accessValidatorMap.put(validator.getClass(),validator);
+         // 注册钩子函数
+         this.registerServerRPCHook(new RPCHook() {
 
+             @Override
+             public void doBeforeRequest(String remoteAddr, RemotingCommand request) {
+                 // Do not catch the exception
+                 validator.validate(validator.parse(request, remoteAddr));
+             }
 
-
-
+             @Override
+             public void doAfterResponse(String remoteAddr, RemotingCommand request, RemotingCommand response) {
+             }
+         });
+     }
+ }
+```
 
 # 思考点
 
