@@ -2952,6 +2952,86 @@ public void run() {
  }
 ```
 
+- 验签
+
+`org.apache.rocketmq.acl.plain.PlainAccessValidator#parse`
+
+`org.apache.rocketmq.acl.common.AclUtils#combineRequestContent`
+
+对扩展字段进行排序，以便于生成签名字符串，然后将扩展字段与请求体（body）写入content字段。Broker端会把请求中的content和secretKey取出来生成验签进行校验。
+
+```java
+ // Content
+SortedMap<String, String> map = new TreeMap<String, String>();
+for (Map.Entry<String, String> entry : request.getExtFields().entrySet()) {
+    if (!SessionCredentials.SIGNATURE.equals(entry.getKey())
+        && !MixAll.UNIQUE_MSG_QUERY_FLAG.equals(entry.getKey())) {
+        map.put(entry.getKey(), entry.getValue());
+    }
+}
+accessResource.setContent(AclUtils.combineRequestContent(request, map));
+
+
+public static byte[] combineRequestContent(RemotingCommand request, SortedMap<String, String> fieldsMap) {
+    try {
+        StringBuilder sb = new StringBuilder("");
+        for (Map.Entry<String, String> entry : fieldsMap.entrySet()) {
+            if (!SessionCredentials.SIGNATURE.equals(entry.getKey())) {
+                sb.append(entry.getValue());
+            }
+        }
+
+        return AclUtils.combineBytes(sb.toString().getBytes(CHARSET), request.getBody());
+    } catch (Exception e) {
+        throw new RuntimeException("Incompatible exception.", e);
+    }
+}
+```
+
+- 配置文件监听
+
+1. 其他配置文件监听，监听文件在构造器传入
+
+​	`org.apache.rocketmq.srvutil.FileWatchService#run`
+
+2. ACL配置文件监听，监听固定路径下指定yml文件
+
+   `org.apache.rocketmq.srvutil.AclFileWatchService#run`
+
+## 主从同步
+
+- RocketMQ HA核心类图
+
+<img src="../../../../resources/pic/ha-service.png" alt="ha-service" style="zoom:50%;" />
+
+### 主从同步原理
+
+##### HAService
+
+- start()
+
+```java
+public void start() throws Exception {
+    // 主服务器启动，并在特定端口上监听从服务器的连接
+    this.acceptSocketService.beginAccept();
+    this.acceptSocketService.start();
+    this.groupTransferService.start();
+    this.haClient.start();
+}
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
 # 思考点
 
 ### 生产环境下 RocketMQ 为什么不能开启自动创建主题？
@@ -3375,6 +3455,8 @@ if (!this.consumeOrderly) {
 // 本地消息保存在ProcessQueue.msgTreeMap
 TreeMap<Long /*偏移量*/, MessageExt /*消息*/> msgTreeMap = new TreeMap<Long, MessageExt>();
 ```
+
+2. 消费进度未提交，客户端或者Broker宕机了。
 
 ### 疑问点，待解决
 
