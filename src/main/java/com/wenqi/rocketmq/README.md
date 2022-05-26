@@ -3022,10 +3022,140 @@ public void start() throws Exception {
     this.haClient.start();
 }
 ```
+#####  AcceptSocketService
+
+`AcceptSocketService`作为`HAService`的内部类并继承了`ServiceThread`，实现主服务器监听从服务器的连接。
+
+- SelectionKey
+
+```txt
+SelectionKey.OP_ACCEPT
+SelectionKey.OP_CONNECT
+SelectionKey.OP_WRITE
+SelectionKey.OP_READ
+```
+
+- beginAccept()
+
+```java
+/**
+ * Starts listening to slave connections.
+ *
+ * @throws Exception If fails.
+ */
+public void beginAccept() throws Exception {
+    // 创建ServerSocketChannel
+    this.serverSocketChannel = ServerSocketChannel.open();
+    // 创建Selector
+    this.selector = RemotingUtil.openSelector();
+    // 设置TCP, 绑定监听端口
+    // socketAddressListen: Broker服务监听套接字 本地IP + 端口号
+    this.serverSocketChannel.socket().setReuseAddress(true);
+    this.serverSocketChannel.socket().bind(this.socketAddressListen);
+    // 设置非阻塞模式
+    this.serverSocketChannel.configureBlocking(false);
+    // 注册连接事件OP_ACCEPT
+    this.serverSocketChannel.register(this.selector, SelectionKey.OP_ACCEPT);
+}
+```
+
+- run()
+
+```java
+public void run() {
+    log.info(this.getServiceName() + " service started");
+
+    while (!this.isStopped()) {
+        try {
+            // 每1s处理一次连接事件
+            this.selector.select(1000);
+            Set<SelectionKey> selected = this.selector.selectedKeys();
+
+            if (selected != null) {
+                // 遍历所有事件
+                for (SelectionKey k : selected) {
+                    // 处理OP_ACCEPT事件
+                    if ((k.readyOps() & SelectionKey.OP_ACCEPT) != 0) {
+                        // 调用ServerSocketChannel的accept()方法创建SocketChannel
+                        SocketChannel sc = ((ServerSocketChannel) k.channel()).accept();
+
+                        if (sc != null) {
+                            HAService.log.info("HAService receive new connection, " + sc.socket().getRemoteSocketAddress());
+
+                            try {
+                                // 创建一个HAConnection
+                                HAConnection conn = new HAConnection(HAService.this, sc);
+                                conn.start();
+                                HAService.this.addConnection(conn);
+                            } catch (Exception e) {
+                                log.error("new HAConnection exception", e);
+                                sc.close();
+                            }
+                        }
+                    } else {
+                        log.warn("Unexpected ops in select " + k.readyOps());
+                    }
+                }
+
+                selected.clear();
+            }
+        } catch (Exception e) {
+            log.error(this.getServiceName() + " service has exception.", e);
+        }
+    }
+
+    log.info(this.getServiceName() + " service end");
+}
+```
 
 
+#####  GroupTransferService
 
+`GroupTransferService`作为`HAService`的内部类并继承了`ServiceThread`，实现主从同步的通知。
 
+- run()
+
+```java
+public void run() {
+    log.info(this.getServiceName() + " service started");
+
+    while (!this.isStopped()) {
+        try {
+            this.waitForRunning(10);
+            this.doWaitTransfer();
+        } catch (Exception e) {
+            log.warn(this.getServiceName() + " service has exception. ", e);
+        }
+    }
+
+    log.info(this.getServiceName() + " service end");
+}
+```
+
+- doWaitTransfer()
+
+Producer发送消息后，需要等待消息复制到slave服务器情景。
+
+```java
+private void doWaitTransfer() {
+    if (!this.requestsRead.isEmpty()) {
+        // 取出isWaitStoreMsgOK的请求
+        for (CommitLog.GroupCommitRequest req : this.requestsRead) {
+            // 已经同步到slave的偏移量push2SlaveMaxOffset是否大于等于Producer发送消息后下一条消息的pi'yi
+            boolean transferOK = HAService.this.push2SlaveMaxOffset.get() >= req.getNextOffset();
+            long deadLine = req.getDeadLine();
+            while (!transferOK && deadLine - System.nanoTime() > 0) {
+                this.notifyTransferObject.waitForRunning(1000);
+                transferOK = HAService.this.push2SlaveMaxOffset.get() >= req.getNextOffset();
+            }
+
+            req.wakeupCustomer(transferOK ? PutMessageStatus.PUT_OK : PutMessageStatus.FLUSH_SLAVE_TIMEOUT);
+        }
+
+        this.requestsRead = new LinkedList<>();
+    }
+}
+```
 
 
 
