@@ -3109,11 +3109,13 @@ public void run() {
 ```
 
 
-#####  GroupTransferService
+#####  
 
 `GroupTransferService`作为`HAService`的内部类并继承了`ServiceThread`，实现主从同步的通知。
 
 - run()
+
+`org.apache.rocketmq.store.ha.HAService.GroupTransferService#run`
 
 ```java
 public void run() {
@@ -3136,23 +3138,44 @@ public void run() {
 
 Producer发送消息后，需要等待消息复制到slave服务器情景。
 
+`org.apache.rocketmq.store.ha.HAService.GroupTransferService#doWaitTransfer`
+
 ```java
 private void doWaitTransfer() {
     if (!this.requestsRead.isEmpty()) {
         // 取出isWaitStoreMsgOK的请求
         for (CommitLog.GroupCommitRequest req : this.requestsRead) {
-            // 已经同步到slave的偏移量push2SlaveMaxOffset是否大于等于Producer发送消息后下一条消息的pi'yi
+            // 已经同步到slave的偏移量push2SlaveMaxOffset是否大于等于Producer发送消息后下一条消息的偏移量
             boolean transferOK = HAService.this.push2SlaveMaxOffset.get() >= req.getNextOffset();
             long deadLine = req.getDeadLine();
             while (!transferOK && deadLine - System.nanoTime() > 0) {
+                // 没有主从同步完成, 等待1s后重试, deadline用来控制超时时间
                 this.notifyTransferObject.waitForRunning(1000);
                 transferOK = HAService.this.push2SlaveMaxOffset.get() >= req.getNextOffset();
             }
-
+            // 是否完成主从同步
             req.wakeupCustomer(transferOK ? PutMessageStatus.PUT_OK : PutMessageStatus.FLUSH_SLAVE_TIMEOUT);
         }
-
+        // 清空同步的请求
         this.requestsRead = new LinkedList<>();
+    }
+}
+```
+
+- notifyTransferSome()
+
+该方法在主服务器收到从服务器的拉取请求后被调用，表示从服务器当前已同步的偏移量。
+
+```java
+public void notifyTransferSome(final long offset) {
+    for (long value = this.push2SlaveMaxOffset.get(); offset > value; ) {
+        boolean ok = this.push2SlaveMaxOffset.compareAndSet(value, offset);
+        if (ok) {
+            this.groupTransferService.notifyTransferSome();
+            break;
+        } else {
+            value = this.push2SlaveMaxOffset.get();
+        }
     }
 }
 ```
