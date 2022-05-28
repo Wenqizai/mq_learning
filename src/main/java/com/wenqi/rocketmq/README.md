@@ -3002,7 +3002,13 @@ public static byte[] combineRequestContent(RemotingCommand request, SortedMap<St
 
 - RocketMQ HA核心类图
 
-<img src="../../../../resources/pic/ha-service.png" alt="ha-service" style="zoom:50%;" />
+AcceptSoketService：主服务器
+
+HAClient：从服务器用来通信客户端
+
+GroupTransferService：主从之间交互实现类
+
+<img src="https://s2.loli.net/2022/05/28/w1K3F8xNiSu6Mlp.png" alt="ha-service" style="zoom:50%;" />
 
 ### 主从同步原理
 
@@ -3109,7 +3115,7 @@ public void run() {
 ```
 
 
-#####  
+#####  GroupTransferService
 
 `GroupTransferService`作为`HAService`的内部类并继承了`ServiceThread`，实现主从同步的通知。
 
@@ -3164,13 +3170,15 @@ private void doWaitTransfer() {
 
 - notifyTransferSome()
 
-该方法在主服务器收到从服务器的拉取请求后被调用，表示从服务器当前已同步的偏移量。
+该方法在主服务器**收到从服务器的拉取请求后被调用**，表示从服务器当前已同步的偏移量。
 
 ```java
 public void notifyTransferSome(final long offset) {
+    // offset从服务器同步的偏移量, 如果offset > push2SlaveMaxOffset, 则更新push2SlaveMaxOffset = offset
     for (long value = this.push2SlaveMaxOffset.get(); offset > value; ) {
         boolean ok = this.push2SlaveMaxOffset.compareAndSet(value, offset);
         if (ok) {
+            // 通知Producer, Producer由此判断消息是否已经成功复制到了从服务器
             this.groupTransferService.notifyTransferSome();
             break;
         } else {
@@ -3180,13 +3188,66 @@ public void notifyTransferSome(final long offset) {
 }
 ```
 
+##### HAClient
 
+`HAClient` 继承于`ServiceThread`，run方法里面主要同步Slave与Master相关的信息，以下是run方法执行的东西。
 
+- connectMaster()
 
+建立到Master服务器的TCP连接，然后注册OP_READ（网络读事件），初始化`currentReportedOffset`为`CommitLog`文件的最大偏移量、`lastWriteTimestamp`上次写入时间戳为当前时间戳。
 
+- isTimeToReportOffset()
 
+是否到时间同步offset到Master，默认大于5s。
 
+- reportSlaveMaxOffset()
 
+通过NIO来同步slave已经拉取的offset到Master。
+
+特别需要留意：==调用网络通道的write()方法是在一个**while**循环中反复判断`ByteBuffer`是否全部写入通道中，这是由于`NIO`是一个非阻塞I/O，调用一次write()方法不一定能将`ByteBuffer`可读字节全部写入。==
+
+- processReadEvent()
+
+处理Master同步过来的信息。
+
+```java
+private boolean processReadEvent() {
+    int readSizeZeroTimes = 0;
+    // 标准处理网络读请求的NIO示例，循环判断buffer里面是否还有数据
+    while (this.byteBufferRead.hasRemaining()) {
+        try {
+            // 读取buffer数据到channel
+            int readSize = this.socketChannel.read(this.byteBufferRead);
+            // 读取到的字节数 > 0，表示有数据
+            if (readSize > 0) {
+                // 重置读取到0字节的次数
+                readSizeZeroTimes = 0;
+                // 分发读请求，主要将同步过来的消息，写入commitlog
+                boolean result = this.dispatchReadRequest();
+                if (!result) {
+                    log.error("HAClient, dispatchReadRequest error");
+                    return false;
+                }
+            } else if (readSize == 0) {
+                // 如果连续3次从网络通道读取到0个字节，则结束本次读任务，返回true。
+                // 因为master调用了3次write()
+                if (++readSizeZeroTimes >= 3) {
+                    break;
+                }
+            } else {
+                // 如果读取到的字节数小于0或发生I/O异常，则返回false。
+                log.info("HAClient, processReadEvent read socket < 0");
+                return false;
+            }
+        } catch (IOException e) {
+            log.info("HAClient, processReadEvent read socket exception", e);
+            return false;
+        }
+    }
+
+    return true;
+}
+```
 
 
 
