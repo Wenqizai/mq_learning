@@ -3010,9 +3010,11 @@ GroupTransferService：主从之间交互实现类
 
 <img src="https://s2.loli.net/2022/05/28/w1K3F8xNiSu6Mlp.png" alt="ha-service" style="zoom:50%;" />
 
+![master-salve-communicate](../../../../resources/pic/master-salve-communicate.png)
+
 ### 主从同步原理
 
-##### HAService
+#### HAService
 
 - start()
 
@@ -3249,13 +3251,197 @@ private boolean processReadEvent() {
 }
 ```
 
+#### HAConnection
 
+主服务器在收到从服务器的连接请求后，会将主从服务器的连接`SocketChawnnel`封装成`HAConnection`对象，实现主服务器与从服务器的读写操作。
 
+##### ReadSocketService
 
+继承于`ServiceThread`，负责网络的读请求。
 
+- run()
 
+```java
+public void run() {
+  HAConnection.log.info(this.getServiceName() + " service started");
+  while (!this.isStopped()) {
+    try {
+      // 每1s处理一次网络的读请求， 从channel中读取数据，并同步salve的offset
+      this.selector.select(1000);
+      boolean ok = this.processReadEvent();
+      if (!ok) {
+        HAConnection.log.error("processReadEvent error");
+        break;
+      }
 
+      long interval = HAConnection.this.haService.getDefaultMessageStore().getSystemClock().now() - this.lastReadTimestamp;
+      if (interval > HAConnection.this.haService.getDefaultMessageStore().getMessageStoreConfig().getHaHousekeepingInterval()) {
+        log.warn("ha housekeeping, found this connection[" + HAConnection.this.clientAddr + "] expired, " + interval);
+        break;
+      }
+    } catch (Exception e) {
+      HAConnection.log.error(this.getServiceName() + " service has exception.", e);
+      break;
+    }
+  }
 
+  this.makeStop();
+
+  writeSocketService.makeStop();
+
+  haService.removeConnection(HAConnection.this);
+
+  HAConnection.this.haService.getConnectionCount().decrementAndGet();
+
+  SelectionKey sk = this.socketChannel.keyFor(this.selector);
+  if (sk != null) {
+    sk.cancel();
+  }
+
+  try {
+    this.selector.close();
+    this.socketChannel.close();
+  } catch (IOException e) {
+    HAConnection.log.error("", e);
+  }
+
+  HAConnection.log.info(this.getServiceName() + " service end");
+}
+```
+
+##### WriteSocketService
+
+继承于`ServiceThread`，负责网络的写请求。
+
+```java
+public void run() {
+  HAConnection.log.info(this.getServiceName() + " service started");
+
+  while (!this.isStopped()) {
+    try {
+      this.selector.select(1000);
+      // slaveRequestOffset等于-1，说明主服务器还未收到从服务器的拉取请求，则放弃本次事件处理。
+      if (-1 == HAConnection.this.slaveRequestOffset) {
+        Thread.sleep(10);
+        continue;
+      }
+      // nextTransferFromWhere为-1，表示初次进行数据传输，计算待传输的物理偏移量
+      if (-1 == this.nextTransferFromWhere) {
+        // 如果slaveRequestOffset为0，则从当前CommitLog文件最大偏移量开始传输，否则根据从服务器的拉取请求偏移量开始传输
+        if (0 == HAConnection.this.slaveRequestOffset) {
+          long masterOffset = HAConnection.this.haService.getDefaultMessageStore().getCommitLog().getMaxOffset();
+          masterOffset =
+            masterOffset
+            - (masterOffset % HAConnection.this.haService.getDefaultMessageStore().getMessageStoreConfig()
+               .getMappedFileSizeCommitLog());
+
+          if (masterOffset < 0) {
+            masterOffset = 0;
+          }
+
+          this.nextTransferFromWhere = masterOffset;
+        } else {
+          this.nextTransferFromWhere = HAConnection.this.slaveRequestOffset;
+        }
+
+        log.info("master transfer data from " + this.nextTransferFromWhere + " to slave[" + HAConnection.this.clientAddr
+                 + "], and slave request " + HAConnection.this.slaveRequestOffset);
+      }
+      // 判断上次写事件是否已将信息全部写入客户端
+      if (this.lastWriteOver) {
+				// 如果已全部写入，且当前系统时间与上次最后写入的时间间隔大于高可用心跳检测时间，则发送一个心跳包
+         // 心跳包间隔haSendHeartbeatInterval，默认5s。
+        long interval =
+          HAConnection.this.haService.getDefaultMessageStore().getSystemClock().now() - this.lastWriteTimestamp;
+
+        if (interval > HAConnection.this.haService.getDefaultMessageStore().getMessageStoreConfig()
+            .getHaSendHeartbeatInterval()) {
+
+          // Build Header
+          // 心跳包的长度为12个字节（从服务器待拉取偏移量+size），消息长度默认为0
+          this.byteBufferHeader.position(0);
+          this.byteBufferHeader.limit(headerSize);
+          this.byteBufferHeader.putLong(this.nextTransferFromWhere);
+          this.byteBufferHeader.putInt(0);
+          this.byteBufferHeader.flip();
+				  // 发送心跳包，主要原因是：避免长连接由于空闲被关闭
+          this.lastWriteOver = this.transferData();
+          if (!this.lastWriteOver)
+            continue;
+        }
+      } else {
+        // 如果上次数据未写完，则先传输上一次的数据，如果消息还是未全部传输，则结束此次事件处理
+        this.lastWriteOver = this.transferData();
+        if (!this.lastWriteOver)
+          continue;
+      }
+			// 根据消息从服务器请求的待拉取消息偏移量，查找该偏移量之后所有的可读消息
+      SelectMappedBufferResult selectResult =
+        HAConnection.this.haService.getDefaultMessageStore().getCommitLogData(this.nextTransferFromWhere);
+			/**
+        * 查找到的消息总长度大于配置高可用传输一次同步任务的最大传输字节数(haTransferBatchSize设置，默认值为32KB)，
+        * 则通过设置ByteBuffer的limit来控制只传输指定长度的字节，
+        * 这就意味着高可用客户端收到的消息会包含不完整的消息。
+        * 高可用服务端消息的传输一直以上述步骤循环运行，每次事件处理完成后等待1s。
+        */
+      if (selectResult != null) {
+        int size = selectResult.getSize();
+        if (size > HAConnection.this.haService.getDefaultMessageStore().getMessageStoreConfig().getHaTransferBatchSize()) {
+          size = HAConnection.this.haService.getDefaultMessageStore().getMessageStoreConfig().getHaTransferBatchSize();
+        }
+
+        long thisOffset = this.nextTransferFromWhere;
+        this.nextTransferFromWhere += size;
+
+        selectResult.getByteBuffer().limit(size);
+        this.selectMappedBufferResult = selectResult;
+
+        // Build Header
+        this.byteBufferHeader.position(0);
+        this.byteBufferHeader.limit(headerSize);
+        this.byteBufferHeader.putLong(thisOffset);
+        this.byteBufferHeader.putInt(size);
+        this.byteBufferHeader.flip();
+
+        this.lastWriteOver = this.transferData();
+      } else {
+			  // 未查到匹配的消息，通知所有等待线程继续等待100ms
+        HAConnection.this.haService.getWaitNotifyObject().allWaitForRunning(100);
+      }
+    } catch (Exception e) {
+
+      HAConnection.log.error(this.getServiceName() + " service has exception.", e);
+      break;
+    }
+  }
+
+  HAConnection.this.haService.getWaitNotifyObject().removeFromWaitingThreadTable();
+
+  if (this.selectMappedBufferResult != null) {
+    this.selectMappedBufferResult.release();
+  }
+
+  this.makeStop();
+
+  readSocketService.makeStop();
+
+  haService.removeConnection(HAConnection.this);
+
+  SelectionKey sk = this.socketChannel.keyFor(this.selector);
+  if (sk != null) {
+    sk.cancel();
+  }
+
+  try {
+    this.selector.close();
+    this.socketChannel.close();
+  } catch (IOException e) {
+    HAConnection.log.error("", e);
+  }
+
+  HAConnection.log.info(this.getServiceName() + " service end");
+}
+```
 
 
 
@@ -3698,4 +3884,6 @@ TreeMap<Long /*偏移量*/, MessageExt /*消息*/> msgTreeMap = new TreeMap<Long
    是的，可参看消息确认过程。
 
 
+
+../../../../resources/pic/
 
