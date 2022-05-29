@@ -3536,6 +3536,100 @@ Broker设置brokerId为slave的两个条件：
 Broker设置brokerId的机制可参看下面文章：
 
 - RocketMQ主从读写分离机制：https://cloud.tencent.com/developer/article/1512980
+- https://blog.csdn.net/qian_348840260/article/details/109628130
+
+### 元数据同步
+
+RocketMQ元数据主要是指topic、消费组订阅信息、消费组消费进度、延迟队列进度。
+
+#### Slave主动同步
+
+在`RocketMQ`的设计中，元数据的同步是单向的，即元数据只能由从节点向主节点发起同步请求，而主节点不能向从节点同步元数据，即使主节点宕机后重启，也不会向从节点同步数据。
+
+Broker启动过程中，如果当前节点的角色为slave，会调用`handleSlaveSynchronize`方法。
+
+```java
+// org.apache.rocketmq.broker.BrokerController#handleSlaveSynchronize
+private void handleSlaveSynchronize(BrokerRole role) {
+  if (role == BrokerRole.SLAVE) {
+    if (null != slaveSyncFuture) {
+      slaveSyncFuture.cancel(false);
+    }
+    this.slaveSynchronize.setMasterAddr(null);
+    // 定时同步，每10s同步一次
+    slaveSyncFuture = this.scheduledExecutorService.scheduleAtFixedRate(new Runnable() {
+      @Override
+      public void run() {
+        try {
+          BrokerController.this.slaveSynchronize.syncAll();
+        }
+        catch (Throwable e) {
+          log.error("ScheduledTask SlaveSynchronize syncAll error.", e);
+        }
+      }
+    }, 1000 * 3, 1000 * 10, TimeUnit.MILLISECONDS);
+  } else {
+    //handle the slave synchronise
+    if (null != slaveSyncFuture) {
+      slaveSyncFuture.cancel(false);
+    }
+    this.slaveSynchronize.setMasterAddr(null);
+  }
+}
+
+
+public void syncAll() {
+  this.syncTopicConfig();
+  this.syncConsumerOffset();
+  this.syncDelayOffset();
+  this.syncSubscriptionGroupConfig();
+}
+```
+
+#### 消息拉取时同步
+
+消息消费进度比起其他元数据来说比较特殊，因为消费进度的变化频率非常快，并且与消费端的行为息息相关。消息消费进度额外的同步机制：根据消息拉取的偏移量来更新消息消费进度
+
+- consumer拉取消息，构建消息进度信息
+
+```java
+// org.apache.rocketmq.client.impl.consumer.DefaultMQPushConsumerImpl#pullMessage
+public void pullMessage(final PullRequest pullRequest) {
+  boolean commitOffsetEnable = false;
+  long commitOffsetValue = 0L;
+  if (MessageModel.CLUSTERING == this.defaultMQPushConsumer.getMessageModel()) {
+    // 从本地获取消费进度
+    commitOffsetValue = this.offsetStore.readOffset(pullRequest.getMessageQueue(), ReadOffsetType.READ_FROM_MEMORY);
+    if (commitOffsetValue > 0) {
+      commitOffsetEnable = true;
+    }
+  }
+	// 构造更新进度系统标志
+  int sysFlag = PullSysFlag.buildSysFlag(
+    commitOffsetEnable, // commitOffset
+    true, // suspend
+    subExpression != null, // subscription
+    classFilter // class filter
+  );
+}
+```
+
+- Broker处理请求，更新进度信息
+
+`brokerAllowSuspend` 表示 broker 是否允许挂起，该值默认为 true，`hasCommitOffsetFlag` 表示消费者在内存中是否缓存了消息消费进度。
+
+从代码逻辑可看出，如果 Broker 为主服务器，并且 `brokerAllowSuspend` 和 `hasCommitOffsetFlag` 都为true，那么就会将消费者消费进度更新到本地。
+
+```java
+boolean storeOffsetEnable = brokerAllowSuspend;
+storeOffsetEnable = storeOffsetEnable && hasCommitOffsetFlag;
+storeOffsetEnable = storeOffsetEnable
+  && this.brokerController.getMessageStoreConfig().getBrokerRole() != BrokerRole.SLAVE;
+if (storeOffsetEnable) {
+  this.brokerController.getConsumerOffsetManager().commitOffset(RemotingHelper.parseChannelRemoteAddr(channel),
+                                                                requestHeader.getConsumerGroup(), requestHeader.getTopic(), requestHeader.getQueueId(), requestHeader.getCommitOffset());
+}
+```
 
 # 思考点
 
@@ -3975,7 +4069,19 @@ TreeMap<Long /*偏移量*/, MessageExt /*消息*/> msgTreeMap = new TreeMap<Long
 
 consumer本地保存一份进度，在消费进度持久化到broker或者拉取消息时，consumer就会把本地最少的偏移量，即消费进度同步到broker。此时Master宕机了，消费进度就会同步到slave，因为进度是保存在consumer本地，所以在向slave拉取消息时，也不会拉取到重复的消息。
 
-​		
+==注意消费进度同步坑点：==
+
+1. 集群模式：Master和Slave都能够保存消费进度，优先Master，Master宕机了才会同步到Slave；
+2. Master宕机：主从消费进度不一致情况（Slave进度 > Master进度）
+   1. 当Master重启时，会启动一个定时任务，每10s将消费进度同步到Slave。Slave接到Master同步信息后，清空本地的进度信息，保存Master的进度信息，以Master为准；
+   2. Master重启后，consumer就会向Master来拉取信息，并将本地保存消费进度更新到Master。（消息拉取时消费进度的更新只会更新到Master）
+   3. Master同步最新的消费进度到Slave，此时Slave的消费进度基本上与Master一致。
+
+RocketMQ在保证高可用情况下，为了解决消息进度主从不一致，消费进度丢失等问题。通常都是本地保存一份信息，最后同步到其他的Broker。
+
+> 消费进度的数据流转
+
+
 
 ../../../../resources/pic/
 
