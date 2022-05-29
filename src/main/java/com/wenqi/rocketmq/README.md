@@ -3443,13 +3443,99 @@ public void run() {
 }
 ```
 
+### 读写分离
 
+#### Broker寻址
 
+`RocketMQ`是根据负载均衡策略之后分配的`MessageQueue`中的`brokerName`来查找Broker的地址。
 
+==注意：==同一组主从服务器：`brokerName`相同而`brokerId`不同，Master的`brokerId`为0，Slave的`brokerId`大于0。
 
+- MessageQueue结构
 
+```java
+public class MessageQueue implements Comparable<MessageQueue>, Serializable {
+    private String topic;
+    private String brokerName;
+    private int queueId;
+}
+```
 
+> 根据BrokerName和BrokerId寻址
 
+- 从本地的brokerAddrTable获取地址
+
+`org.apache.rocketmq.client.impl.factory.MQClientInstance#findBrokerAddressInSubscribe`
+
+- 根据mq来获取本次访问的brokerId
+
+`org.apache.rocketmq.client.impl.consumer.PullAPIWrapper#recalculatePullFromWhichNode`
+
+```java
+public long recalculatePullFromWhichNode(final MessageQueue mq) {
+  if (this.isConnectBrokerByUser()) {
+    return this.defaultBrokerId;
+  }
+	// ConcurrentMap<MessageQueue, AtomicLong/* brokerId */> pullFromWhichNodeTable;
+  AtomicLong suggest = this.pullFromWhichNodeTable.get(mq);
+  if (suggest != null) {
+    return suggest.get();
+  }
+
+  return MixAll.MASTER_ID;
+}
+```
+
+- brokerId保存在pullFromWhichNodeTable的过程
+
+```java
+// 此方法可知, brokerId已经确定了, 由外面传入
+// org.apache.rocketmq.client.impl.consumer.PullAPIWrapper#updatePullFromWhichNode
+public void updatePullFromWhichNode(final MessageQueue mq, final long brokerId) {
+  AtomicLong suggest = this.pullFromWhichNodeTable.get(mq);
+  if (null == suggest) {
+    this.pullFromWhichNodeTable.put(mq, new AtomicLong(brokerId));
+  } else {
+    suggest.set(brokerId);
+  }
+}
+
+// 此方法在consumer拉取完消息之后PullCallBack里面调用, 用处理拉取的消息结果过程, 可知brokerId由PullResultExt传入
+// org.apache.rocketmq.client.impl.consumer.PullAPIWrapper#processPullResult
+public PullResult processPullResult(final MessageQueue mq, final PullResult pullResult,
+                                    final SubscriptionData subscriptionData) {
+  PullResultExt pullResultExt = (PullResultExt) pullResult;
+
+  this.updatePullFromWhichNode(mq, pullResultExt.getSuggestWhichBrokerId());
+  if (PullStatus.FOUND == pullResult.getPullStatus()) {
+    ByteBuffer byteBuffer = ByteBuffer.wrap(pullResultExt.getMessageBinary());
+    List<MessageExt> msgList = MessageDecoder.decodes(byteBuffer);
+  }
+}
+
+// 此方法是consumer提交拉取消息之后, 处理broker返回结果
+// 方法最后new PullResultExt(), brokerId = responseHeader.getSuggestWhichBrokerId()
+// 由此可以brokerId在broker里面已经设定好了
+private PullResult processPullResponse(
+  final RemotingCommand response,
+  final String addr) throws MQBrokerException, RemotingCommandException {
+
+  PullMessageResponseHeader responseHeader =
+    (PullMessageResponseHeader) response.decodeCommandCustomHeader(PullMessageResponseHeader.class);
+
+  return new PullResultExt(pullStatus, responseHeader.getNextBeginOffset(), responseHeader.getMinOffset(),
+                           responseHeader.getMaxOffset(), null, responseHeader.getSuggestWhichBrokerId(), response.getBody());
+}
+```
+
+Broker设置brokerId为slave的两个条件：
+
+1. Master拉取消息缓慢：消息堆积量是否大于物理内存的 40 %
+2. Slave服务器消息可读：`slaveReadEnable == true`。
+
+Broker设置brokerId的机制可参看下面文章：
+
+- RocketMQ主从读写分离机制：https://cloud.tencent.com/developer/article/1512980
 
 # 思考点
 
@@ -3879,11 +3965,17 @@ TreeMap<Long /*偏移量*/, MessageExt /*消息*/> msgTreeMap = new TreeMap<Long
 
 ### 疑问点，待解决
 
-1. 延迟消息，重试消息都是创建一个msgId，放在一个统一Topic里面，不影响正常消息的消费进度吗？
+> 延迟消息，重试消息都是创建一个msgId，放在一个统一Topic里面，不影响正常消息的消费进度吗？
 
-   是的，可参看消息确认过程。
+是的，可参看消息确认过程。
 
+> consumer开始从master消费，后来转移到slave消费，那么转移之后slave消费如何同步到master。我们知道消费进度的保存：广播本地，集群broker。
 
+参看文档: [RocketMQ主从如何同步消息消费进度？](https://cloud.tencent.com/developer/article/1512978)
+
+consumer本地保存一份进度，在消费进度持久化到broker或者拉取消息时，consumer就会把本地最少的偏移量，即消费进度同步到broker。此时Master宕机了，消费进度就会同步到slave，因为进度是保存在consumer本地，所以在向slave拉取消息时，也不会拉取到重复的消息。
+
+​		
 
 ../../../../resources/pic/
 
