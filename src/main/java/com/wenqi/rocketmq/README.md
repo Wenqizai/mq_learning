@@ -3631,6 +3631,32 @@ if (storeOffsetEnable) {
 }
 ```
 
+## 消息轨迹
+
+引入消息轨迹的目的：记录一条消息的流转轨迹，即消息是由哪个IP发送的？什么时候发送的？是被哪个消费者消费的？
+
+### 使用方法
+
+1. 构造Producer，Consumer
+
+`traceTopic`：用于记录消息轨迹的topic，默认为`RMQ_SYS_TRACE_TOPIC`。
+
+```java
+// Producer
+public DefaultMQProducer(String producerGroup, boolean enableMsgTrace) {}
+public DefaultMQProducer(String producerGroup, boolean enableMsgTrace, String traceTopic) {}
+
+// Consumer
+public DefaultMQPushConsumer(final String consumerGroup, boolean enableMsgTrace)
+public DefaultMQPushConsumer(String croup, boolean enableMsgTrace, String traceTopic)
+public DefaultMQPushConsumer(final String consumerGroup, boolean enableMsgTrace)
+public DefaultMQPushConsumer(String croup, boolean enableMsgTrace, String traceTopic)
+```
+
+2. 构造参数设置：`enableMsgTrace == true`
+
+
+
 # 思考点
 
 ### 生产环境下 RocketMQ 为什么不能开启自动创建主题？
@@ -3827,6 +3853,19 @@ public void updateTopicRouteInfoFromNameServer() {
     }
 }
 ```
+
+### About Perm
+
+| Perm         | value | 描述      |
+| ------------ | ----- | --------- |
+| PERM_INHERIT | 1     | Topic继承 |
+| PERM_READ    | 4     | Topic可读 |
+| PERM_WRITE   | 2     | Topic可写 |
+
+- perm = 6：可读可写
+- perm = 7：可读可写可继承
+
+==注意：==`autoCreateTopicEnable=true`情况下自动新建Topic是通过继承`TBW102`实现的，如果把`TBW102`的perm改为6，将不会自动创建Topic。修改perm参数配置文件：`config/topic.json`
 
 ### RocketMQ性能改良
 
