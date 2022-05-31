@@ -3655,7 +3655,150 @@ public DefaultMQPushConsumer(String croup, boolean enableMsgTrace, String traceT
 
 2. 构造参数设置：`enableMsgTrace == true`
 
+### 原理
 
+消息轨迹的信息收集主要是通过消息发送和消费前后的钩子hook函数来执行。
+
+> 记录
+
+- producer
+
+`org.apache.rocketmq.client.hook.SendMessageHook`
+
+`org.apache.rocketmq.client.trace.hook.SendMessageTraceHookImpl`
+
+- consumer
+
+`org.apache.rocketmq.client.hook.ConsumeMessageHook`
+
+`org.apache.rocketmq.client.trace.hook.ConsumeMessageTraceHookImpl`
+
+> 存储
+
+如果Broker设置`traceTopicEnable == true`，系统会在Broker上创建名为`RMQ_SYS_TRACE_TOPIC`的topic，队
+列个数为1，该值默认为false。消息轨迹数据作为一条消息，存储到该topic上。
+
+==注意：==
+
+通常为了避免消息轨迹的数据与正常的业务数据混在一起，官方建议在**Broker集群中新增一台机器，只在这台机器上开启消息轨迹跟踪，**这样该集群内的消息轨迹数据只会发送到这一台Broker服务器上，并不会增加集群内原先业务Broker的负载压力。
+
+### 源码
+
+- 关联类图
+
+<img src="../../../../resources/pic/message-trace-class.png" alt="message-trace-class"  />
+
+- 时序图
+
+<img src="../../../../resources/pic/message-trace-seq.png" alt="message-trace-class"  />
+
+> 记录
+
+`org.apache.rocketmq.client.trace.hook.SendMessageTraceHookImpl`
+
+1. `sendMessageBefore()`：发送消息之前被调用的，创建调用的上下文`TraceContext`，用来收集消息轨迹的等基础信息`TraceBean`。包括：消息的topic、tag、key、存储Broker IP、消息体的长度，时间戳等。
+2. `sendMessageAfter()`：收到服务端消息发送响应请求后被调用。如果开启了消息轨迹，则上下文`TraceContext != null`。
+
+```java
+@Override
+public void sendMessageAfter(SendMessageContext context) {
+    //if it is message trace data,then it doesn't recorded
+    if (context == null || context.getMessage().getTopic().startsWith(((AsyncTraceDispatcher) localDispatcher).getTraceTopicName())
+        || context.getMqTraceContext() == null) {
+        return;
+    }
+    if (context.getSendResult() == null) {
+        return;
+    }
+
+    if (context.getSendResult().getRegionId() == null
+        || !context.getSendResult().isTraceOn()) {
+        // if switch is false,skip it
+        return;
+    }
+
+    TraceContext tuxeContext = (TraceContext) context.getMqTraceContext();
+    TraceBean traceBean = tuxeContext.getTraceBeans().get(0);
+    // 消息发送耗时
+    int costTime = (int) ((System.currentTimeMillis() - tuxeContext.getTimeStamp()) / tuxeContext.getTraceBeans().size());
+    // 是否发送成功
+    tuxeContext.setCostTime(costTime);
+    if (context.getSendResult().getSendStatus().equals(SendStatus.SEND_OK)) {
+        tuxeContext.setSuccess(true);
+    } else {
+        tuxeContext.setSuccess(false);
+    }
+    // 发送到Broker所在的分区
+    tuxeContext.setRegionId(context.getSendResult().getRegionId());
+    // 消息ID，全局唯一
+    traceBean.setMsgId(context.getSendResult().getMsgId());
+    // 消息物理偏移量，如果是批量消息，则是最后一条消息的物理偏移量
+    traceBean.setOffsetMsgId(context.getSendResult().getOffsetMsgId());
+    // 这个存储时间并没有取消息的实际存储时间，而是取一个估算值，即客户端发送时间一半的耗时来表示消息的存储时间
+    traceBean.setStoreTime(tuxeContext.getTimeStamp() + costTime / 2);
+    // AsyncTraceDispatcher异步将消息轨迹数据发送到消息服务器（Broker）上
+    localDispatcher.append(tuxeContext);
+}
+```
+
+> 消息轨迹转发
+
+注意：hook before负责创建上下文，after处理上下文之后才执行数据异步转发。
+
+转发的实现类：`org.apache.rocketmq.client.trace.AsyncTraceDispatcher`
+
+- append：将消息轨迹上下文加入处理队列
+
+```java
+public boolean append(final Object ctx) {
+    boolean result = traceContextQueue.offer((TraceContext) ctx);
+    if (!result) {
+        log.info("buffer full" + discardCount.incrementAndGet() + " ,context is " + ctx);
+    }
+    return result;
+}
+```
+
+- 后台启动线程，批量提交给线程池，让producer发送消息
+
+```java
+class AsyncRunnable implements Runnable {
+    private boolean stopped;
+
+    @Override
+    public void run() {
+        while (!stopped) {
+            List<TraceContext> contexts = new ArrayList<TraceContext>(batchSize);
+            synchronized (traceContextQueue) {
+                for (int i = 0; i < batchSize; i++) {
+                    TraceContext context = null;
+                    try {
+                        //get trace data element from blocking Queue - traceContextQueue
+                        context = traceContextQueue.poll(5, TimeUnit.MILLISECONDS);
+                    } catch (InterruptedException e) {
+                    }
+                    if (context != null) {
+                        contexts.add(context);
+                    } else {
+                        break;
+                    }
+                }
+                if (contexts.size() > 0) {
+                    AsyncAppenderRequest request = new AsyncAppenderRequest(contexts);
+                    traceExecutor.submit(request);
+                } else if (AsyncTraceDispatcher.this.stopped) {
+                    this.stopped = true;
+                }
+            }
+        }
+
+    }
+}
+```
+
+- 线程池处理逻辑
+
+`org.apache.rocketmq.client.trace.AsyncTraceDispatcher.AsyncAppenderRequest#sendTraceData`
 
 # 思考点
 
