@@ -3631,6 +3631,286 @@ if (storeOffsetEnable) {
 }
 ```
 
+## 主从切换
+
+`RocketMQ` 4.5 版本之前，`RocketMQ` 只有 Master/Slave 一种部署方式。Master Broker 挂了之后 ，没办法让 Slave Broker 自动切换为新的 Master Broker，需要手动更改配置将 Slave Broker 设置为 Master Broker，或者重启Master机器。重新部署期间服务不可用。
+
+使用`Dledger`技术， 一但 Master 宕机，`Dledger` 就可以从剩下的两个 Broker 中选举一个 Master 继续对外提供服务。
+
+> 相关文档
+
+1. 分布式一致性协议Raft
+
+   https://blog.csdn.net/csdn_lhs/article/details/108029978
+
+   https://blog.csdn.net/csdn_lhs/article/details/108047563
+
+   https://www.cnblogs.com/mindwind/p/5231986.html
+
+2. `RocketMQ`部署方式大全
+
+   https://chenzhonzhou.github.io/2021/01/11/rocketmq-ji-qun-yuan-li-ji-bu-shu-fang-shi/
+
+3. 开启`DLedger`之后性能骤降30倍
+
+   https://blog.csdn.net/sinat_14840559/article/details/117295525
+
+4. `Apache RocketMQ` 发布 4.8.0，`DLedger` 模式全面提升
+
+   https://mp.weixin.qq.com/s/dRhkZ_sSp-97uv0JPvF5vA
+
+5. 源码分析 `RocketMQ DLedger` 多副本即主从切换实现原理
+
+   https://www.modb.pro/db/110412
+
+> 流程图
+
+![主从切换](https://oss-emcsprod-public.modb.pro/wechatSpider/modb_20210916_b3efa84c-16a4-11ec-b2e7-00163e068ecd.png)
+
+### 主从切换相关方法
+
+#### start()
+
+`org.apache.rocketmq.broker.BrokerController#start`
+
+```java
+// Broker启动
+public void start() throws Exception {
+    // broker.conf配置了enableDLegerCommitLog = true不会调用此方法
+    // 但是，会在changeToSalve、changeToMaster调用下述方法开启DLedger
+    if (!messageStoreConfig.isEnableDLegerCommitLog()) {
+        startProcessorByHa(messageStoreConfig.getBrokerRole());
+        handleSlaveSynchronize(messageStoreConfig.getBrokerRole());
+        this.registerBrokerAll(true, false, true);
+    }
+}
+
+// 当节点为主节点时，开启对应的事务状态回查处理器
+private void startProcessorByHa(BrokerRole role) {
+    if (BrokerRole.SLAVE != role) {
+        if (this.transactionalMessageCheckService != null) {
+            this.transactionalMessageCheckService.start();
+        }
+    }
+}
+
+// 从节点向主节点主动同步 topic 的路由信息、消费进度、延迟队列处理队列、消费组订阅配置等信息。
+private void handleSlaveSynchronize(BrokerRole role) {
+    if (role == BrokerRole.SLAVE) {
+        // 如果上次同步的 future 不为空，则首先先取消。
+        if (null != slaveSyncFuture) {
+            slaveSyncFuture.cancel(false);
+        }
+        // 设置Master地址为空, 说明有地方把Master地址设置了(其实也就registerBrokerAll设置了)
+        this.slaveSynchronize.setMasterAddr(null);
+        // 开启定时同步任务，每 10s 从主节点同步一次元数据
+        slaveSyncFuture = this.scheduledExecutorService.scheduleAtFixedRate(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    BrokerController.this.slaveSynchronize.syncAll();
+                }
+                catch (Throwable e) {
+                    log.error("ScheduledTask SlaveSynchronize syncAll error.", e);
+                }
+            }
+        }, 1000 * 3, 1000 * 10, TimeUnit.MILLISECONDS);
+    } else {
+        // 如果当前节点的角色为主节点，则取消定时同步任务并设置 master 的地址为空
+        //handle the slave synchronise
+        if (null != slaveSyncFuture) {
+            slaveSyncFuture.cancel(false);
+        }
+        this.slaveSynchronize.setMasterAddr(null);
+    }
+}
+```
+
+#### shutdownProcessorByHa()
+
+```java
+private void shutdownProcessorByHa() {
+    if (this.transactionalMessageCheckService != null) {
+        this.transactionalMessageCheckService.shutdown(true);
+    }
+}
+```
+
+#### changeToSlave()
+
+切换成slave节点，`DLedgerRoleChangeHandler`调用
+
+```java
+public void changeToSlave(int brokerId) {
+    log.info("Begin to change to slave brokerName={} brokerId={}", brokerConfig.getBrokerName(), brokerId);
+
+    //change the role
+    brokerConfig.setBrokerId(brokerId == 0 ? 1 : brokerId); //TO DO check
+    messageStoreConfig.setBrokerRole(BrokerRole.SLAVE);
+
+    //handle the scheduled service
+    try {
+        // 如果是从节点，则关闭定时调度线程(处理 RocketMQ 延迟队列)，如果是主节点，则启动该线程
+        this.messageStore.handleScheduleMessageService(BrokerRole.SLAVE);
+    } catch (Throwable t) {
+        log.error("[MONITOR] handleScheduleMessageService failed when changing to slave", t);
+    }
+
+    //handle the transactional service
+    try {
+        // 关闭事务状态回查处理器
+        this.shutdownProcessorByHa();
+    } catch (Throwable t) {
+        log.error("[MONITOR] shutdownProcessorByHa failed when changing to slave", t);
+    }
+
+    //handle the slave synchronise
+    // 从节点需要启动元数据同步处理器，即启动 SlaveSynchronize 定时从主服务器同步元数据
+    handleSlaveSynchronize(BrokerRole.SLAVE);
+
+    try {
+        // 立即向集群内所有的 nameserver 告知 broker  信息状态的变更
+        this.registerBrokerAll(true, true, true);
+    } catch (Throwable ignored) {
+
+    }
+    log.info("Finish to change to slave brokerName={} brokerId={}", brokerConfig.getBrokerName(), brokerId);
+}
+```
+
+#### changeToMaster()
+
+切换成Master节点，`DLedgerRoleChangeHandler`调用
+
+```java
+public void changeToMaster(BrokerRole role) {
+    if (role == BrokerRole.SLAVE) {
+        return;
+    }
+    log.info("Begin to change to master brokerName={}", brokerConfig.getBrokerName());
+
+    //handle the slave synchronise
+    // 关闭元数据同步器，因为主节点无需同步
+    handleSlaveSynchronize(role);
+
+    //handle the scheduled service
+    try {
+        // 开启定时任务处理线程
+        this.messageStore.handleScheduleMessageService(role);
+    } catch (Throwable t) {
+        log.error("[MONITOR] handleScheduleMessageService failed when changing to master", t);
+    }
+
+    //handle the transactional service
+    try {
+        // 开启事务状态回查处理线程
+        this.startProcessorByHa(BrokerRole.SYNC_MASTER);
+    } catch (Throwable t) {
+        log.error("[MONITOR] startProcessorByHa failed when changing to master", t);
+    }
+
+    //if the operations above are totally successful, we change to master
+    brokerConfig.setBrokerId(0); //TO DO check
+    messageStoreConfig.setBrokerRole(role);
+
+    try {
+        // 向 nameserver 立即发送心跳包以便告知 broker 服务器当前最新的状态
+        this.registerBrokerAll(true, true, true);
+    } catch (Throwable ignored) {
+
+    }
+    log.info("Finish to change to master brokerName={}", brokerConfig.getBrokerName());
+}
+```
+
+### 选举触发主从切换
+
+>  Broker启动初始化，创建handler
+
+`org.apache.rocketmq.broker.BrokerController#initialize`
+
+```java
+public boolean initialize() throws CloneNotSupportedException {
+    if (messageStoreConfig.isEnableDLegerCommitLog()) {
+        // 开启了DLedger，创建事件处理器DLedgerRoleChangeHandler
+        DLedgerRoleChangeHandler roleChangeHandler = new DLedgerRoleChangeHandler(this, (DefaultMessageStore) messageStore);
+        ((DLedgerCommitLog)((DefaultMessageStore) messageStore).getCommitLog()).getdLedgerServer().getdLedgerLeaderElector().addRoleChangeHandler(roleChangeHandler);
+    }
+}
+```
+
+> DLedgerRoleChangeHandler
+
+- handle
+
+```java
+@Override 
+public void handle(long term, MemberState.Role role) {
+    Runnable runnable = new Runnable() {
+        @Override public void run() {
+            long start = System.currentTimeMillis();
+            try {
+                boolean succ = true;
+                log.info("Begin handling broker role change term={} role={} currStoreRole={}", term, role, messageStore.getMessageStoreConfig().getBrokerRole());
+                switch (role) {
+                    case CANDIDATE:
+                        // 如果当前节点状态机状态为 CANDIDATE，表示正在发起 Leader 节点
+                        // 如果该服务器的角色不是 SLAVE 的话，需要将状态切换为 SLAVE
+                        if (messageStore.getMessageStoreConfig().getBrokerRole() != BrokerRole.SLAVE) {
+                            brokerController.changeToSlave(dLedgerCommitLog.getId());
+                        }
+                        break;
+                    case FOLLOWER:
+                        // 如果当前节点状态机状态为 FOLLOWER，broker 节点将转换为从节点
+                        brokerController.changeToSlave(dLedgerCommitLog.getId());
+                        break;
+                    case LEADER:
+                        // 如果当前节点状态机状态为 Leader，说明该节点被选举为 Leader
+                        // 在切换到Master节点之前，首先需要等待当前节点追加的数据都已经被提交后才可以将状态变更为Master
+                        // 循环等待
+                        while (true) {
+                            // 当前状态机状态是Leader的身份已经切换，直接返回
+                            if (!dLegerServer.getMemberState().isLeader()) {
+                                succ = false;
+                                break;
+                            }
+                            // ledgerEndIndex为-1，表示当前节点还没有数据转发，直接跳出循环，无需等待
+                            if (dLegerServer.getdLedgerStore().getLedgerEndIndex() == -1) {
+                                break;
+                            }
+                            // 如果ledgerEndIndex不为 -1 ，则必须等待数据都已提交，即 ledgerEndIndex 与 committedIndex 相等
+                            // 同时需要等待commitlog 日志全部已转发到 consumequeue中，messageStore.dispatchBehindBytes() == 0
+                            // 即 ReputMessageService 中的 reputFromOffset 与 commitlog 的 maxOffset 相等。
+                            if (dLegerServer.getdLedgerStore().getLedgerEndIndex() == dLegerServer.getdLedgerStore().getCommittedIndex()
+                                && messageStore.dispatchBehindBytes() == 0) {
+                                break;
+                            }
+                            Thread.sleep(100);
+                        }
+                        // 满足上述条件，可以切换成Master
+                        if (succ) {
+                            // 恢复ConsumeQueue，维护每一个queue 对应的 maxOffset
+                            messageStore.recoverTopicQueueTable();
+                            // 切换成Master
+                            brokerController.changeToMaster(BrokerRole.SYNC_MASTER);
+                        }
+                        break;
+                    default:
+                        break;
+                }
+                log.info("Finish handling broker role change succ={} term={} role={} currStoreRole={} cost={}", succ, term, role, messageStore.getMessageStoreConfig().getBrokerRole(), DLedgerUtils.elapsed(start));
+            } catch (Throwable t) {
+                log.info("[MONITOR]Failed handling broker role change term={} role={} currStoreRole={} cost={}", term, role, messageStore.getMessageStoreConfig().getBrokerRole(), DLedgerUtils.elapsed(start), t);
+            }
+        }
+    };
+    // 线程池为单一线程池，顺序处理身份切换事件
+    executorService.submit(runnable);
+}
+```
+
+
+
 ## 消息轨迹
 
 引入消息轨迹的目的：记录一条消息的流转轨迹，即消息是由哪个IP发送的？什么时候发送的？是被哪个消费者消费的？
