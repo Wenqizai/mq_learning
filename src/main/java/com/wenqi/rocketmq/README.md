@@ -4957,8 +4957,18 @@ public CompletableFuture<AppendEntryResponse> waitAck(DLedgerEntry entry, boolea
 
 #### 传播
 
+日志节点间传播的关键点：
 
+1. 已提交日志序号，该如何实现
+2. 客户端向`DLedger`集群发送一条日志，必须得到集群中大多数节点的认可才能被认为写入成功
+3. raft 协议中追加、提交两个动作如何实现
 
+日志传播主要实现类：`io.openmessaging.storage.dledger.DLedgerEntryPusher`
+
+- DLedgerEntryPusher：日志转发与处理核心类，该类的startup初始化会启动其3个线程内部类。
+- EntryHandler：日志接收处理线程，当节点为从节点时激活
+- QuorumAckChecker：日志追加ACK投票处理线程，当前节点为主节点时激活
+- EntryDispatcher：日志转发线程，当前节点为主节点时追加
 
 
 ## 消息轨迹
