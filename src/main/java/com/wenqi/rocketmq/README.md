@@ -3631,7 +3631,7 @@ if (storeOffsetEnable) {
 }
 ```
 
-## 主从切换
+## 主从切换Dledger
 
 `RocketMQ` 4.5 版本之前，`RocketMQ` 只有 Master/Slave 一种部署方式。Master Broker 挂了之后 ，没办法让 Slave Broker 自动切换为新的 Master Broker，需要手动更改配置将 Slave Broker 设置为 Master Broker，或者重启Master机器。重新部署期间服务不可用。
 
@@ -3661,19 +3661,23 @@ if (storeOffsetEnable) {
 
 5. 系列文档
 
+   丁威DLedger系列文章：https://developer.aliyun.com/article/721615
+   
    初探raft协议：https://www.modb.pro/db/110422
    
    主从切换实现原理：https://www.modb.pro/db/110412
    
-   Leader选主：https://www.modb.pro/db/110421
+   Leader选主：https://developer.aliyun.com/article/718342
 
 > 流程图
 
 ![主从切换](https://oss-emcsprod-public.modb.pro/wechatSpider/modb_20210916_b3efa84c-16a4-11ec-b2e7-00163e068ecd.png)
 
-### 主从切换相关方法
+### 主从切换原理
 
-#### start()
+#### 主从切换相关方法
+
+##### start()
 
 `org.apache.rocketmq.broker.BrokerController#start`
 
@@ -3730,7 +3734,7 @@ private void handleSlaveSynchronize(BrokerRole role) {
 }
 ```
 
-#### shutdownProcessorByHa()
+##### shutdownProcessorByHa()
 
 ```java
 private void shutdownProcessorByHa() {
@@ -3740,7 +3744,7 @@ private void shutdownProcessorByHa() {
 }
 ```
 
-#### changeToSlave()
+##### changeToSlave()
 
 切换成slave节点，`DLedgerRoleChangeHandler`调用
 
@@ -3782,7 +3786,7 @@ public void changeToSlave(int brokerId) {
 }
 ```
 
-#### changeToMaster()
+##### changeToMaster()
 
 切换成Master节点，`DLedgerRoleChangeHandler`调用
 
@@ -3827,7 +3831,7 @@ public void changeToMaster(BrokerRole role) {
 }
 ```
 
-### 选举触发主从切换
+#### 选举触发主从切换
 
 >  Broker启动初始化，创建handler
 
@@ -3913,7 +3917,7 @@ public void handle(long term, MemberState.Role role) {
 }
 ```
 
-### 选举
+### 选主
 
 > 基本原则
 
@@ -4001,7 +4005,7 @@ CompletableFuture<PushEntryResponse> push(PushEntryRequest request) throws Excep
 
   `Dledger Server`，`Dledger` 节点的封装类。
 
-### DLedgerLeaderElector
+#### DLedgerLeaderElector
 
 - config：配置
 
@@ -4099,7 +4103,7 @@ private void maintainState() throws Exception {
 
 > 温馨提示：在raft协议中，节点的状态默认为follower，`DLedger`的实现从candidate开始，一开始，集群内的所有节点都会尝试发起投票，这样第一轮要达成选举几乎不太可能。
 
-#### maintainAsCandidate
+##### maintainAsCandidate
 
 该方法主要是处理candidate节点，发出投票，选出Leader。
 
@@ -4304,7 +4308,7 @@ public enum RESULT {
 }
 ```
 
-#### maintainAsLeader
+##### maintainAsLeader
 
 该方法主要是向集群内的所有节点发送心跳包。
 
@@ -4331,7 +4335,7 @@ private void maintainAsLeader() throws Exception {
 }
 ```
 
-#### maintainAsFollower
+##### maintainAsFollower
 
 ```java
 private void maintainAsFollower() {
@@ -4348,7 +4352,7 @@ private void maintainAsFollower() {
 }
 ```
 
-#### voteForQuorumResponses
+##### voteForQuorumResponses
 
 该方法为candidate调用，构造投票request，向其他节点发送投票请求。
 
@@ -4383,7 +4387,7 @@ private List<CompletableFuture<VoteResponse>> voteForQuorumResponses(long term, 
 }
 ```
 
-#### handleVote
+##### handleVote
 
 该方法主要处理candidate发起投票请求。
 
@@ -4479,7 +4483,7 @@ public CompletableFuture<VoteResponse> handleVote(VoteRequest request, boolean s
 }
 ```
 
-#### sendHeartbeats
+##### sendHeartbeats
 
 成为Leader之后，向集群节点发送心跳包。
 
@@ -4579,7 +4583,7 @@ private void sendHeartbeats(long term, String leaderId) throws Exception {
 }
 ```
 
-#### handleHeartBeat
+##### handleHeartBeat
 
 此方法主要处理Leader发送过来的心跳包。
 
@@ -4648,7 +4652,91 @@ public CompletableFuture<HeartBeatResponse> handleHeartBeat(HeartBeatRequest req
 }
 ```
 
-![节点选举](https://oss-emcsprod-public.modb.pro/wechatSpider/modb_20210916_fbc33904-16a4-11ec-af64-00163e068ecd.png)
+![节点选举](README.assets/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3ByZXN0aWdlZGluZw==,size_16,color_FFFFFF,t_70.png)
+
+
+
+### DLedger存储
+
+`RocketMQ DLedger` 的存储实现思路与 `RocketMQ` 的存储实现思路相似。
+
+#### 对比RocketMQ
+
+|                          |                `RocketMQ`                 |           `RocketMQ DLedger`           |
+| :----------------------: | :---------------------------------------: | :------------------------------------: |
+|       单个物理文件       |                MappedFile                 |            DefaultMmapFIle             |
+|       多个物理文件       |                MappedFile                 |              MmapFileList              |
+|       存储逻辑实现       |            DefaultMessageStore            |          DLedgerMmapFileStore          |
+|   commitlog文件的刷盘    |      Commitlog#FlushCommitLogService      | DLedgerMmapFileStore#FlushDataService  |
+| commitlog 过期文件的删除 | DefaultMessageStore#CleanCommitlogService | DLedgerMmapFileStore#CleanSpaceService |
+
+#### 存储结构
+
+> DLedger数据
+
+![DLedger-data-construct](../../../../resources/pic/DLedger-data-construct.png)
+
+- magic：魔数，4字节
+- size：条目总长度，包含Header（协议头）+ 消息体，占4字节
+- entryIndex：当前条目的index，占8字节
+- entryTerm：当前条目所属的投票轮次，占8字节
+- pos：该条目的物理偏移量，类似于 commitlog 文件的物理偏移量，占8字节
+- channel：保留字段，当前版本未使用，占4字节
+- chain crc：当前版本未使用，占4字节
+- body crc：body的 CRC 校验和，用来区分数据是否损坏，占4字节
+- body size：用来存储body的长度，占4字节
+- body：具体的消息内容
+
+源码实现：DLedgerMmapFileStore#recover、DLedgerEntry、DLedgerEntryCoder
+
+> DLedger索引
+
+![DLedger-index-construct.png](../../../../resources/pic/DLedger-index-construct.png)
+
+索引条目固定32字节。
+
+#### 实现类
+
+- DLedgerStore：存储抽象类
+- DLedgerMmapFileStore：基于内存的日志存储实现
+- DLedgerMemoryStore：基于文件内存映射机制的存储实现
+
+```java
+public abstract class DLedgerStore {
+	// 子类重写
+  public MemberState getMemberState() { return null;}
+	// 向主节点追加日志(数据)
+  public abstract DLedgerEntry appendAsLeader(DLedgerEntry entry);
+	// 向从节点同步日志
+  public abstract DLedgerEntry appendAsFollower(DLedgerEntry entry, long leaderTerm, String leaderId);
+	// 根据日志下标index查找日志
+  public abstract DLedgerEntry get(Long index);
+	// 获取已提交的下标
+  public abstract long getCommittedIndex();
+	// 更新已提交的下标，子类实现
+  public void updateCommittedIndex(long term, long committedIndex) {}
+	// 获取 Leader 当前最大的投票轮次
+  public abstract long getLedgerEndTerm();
+	// 获取 Leader 下一条日志写入的下标（最新日志的下标）
+  public abstract long getLedgerEndIndex();
+	// 获取 Leader 第一条消息的下标
+  public abstract long getLedgerBeginIndex();
+	// 更新 Leader 维护的 ledgerEndIndex 和 ledgerEndTerm
+  protected void updateLedgerEndIndexAndTerm() {
+    if (getMemberState() != null) {
+      getMemberState().updateLedgerIndexAndTerm(getLedgerEndIndex(), getLedgerEndTerm());
+    }
+  }
+	// 刷写，空方法，由具体子类实现
+  public void flush() {}
+	// 删除日志，空方法，由具体子类实现
+  public long truncate(DLedgerEntry entry, long leaderTerm, String leaderId) {return -1;}
+	// 启动存储管理器，空方法，由具体子类实现
+  public void startup() {}
+	// 关闭存储管理器，空方法，由具体子类实现
+  public void shutdown() {}
+}
+```
 
 ## 消息轨迹
 
