@@ -3668,6 +3668,10 @@ if (storeOffsetEnable) {
    主从切换实现原理：https://www.modb.pro/db/110412
    
    Leader选主：https://developer.aliyun.com/article/718342
+   
+   日志追加流程：https://developer.aliyun.com/article/718481
+   
+   日志复制（传播）：https://developer.aliyun.com/article/719147
 
 > 流程图
 
@@ -4693,7 +4697,7 @@ public CompletableFuture<HeartBeatResponse> handleHeartBeat(HeartBeatRequest req
 
 ![DLedger-index-construct.png](../../../../resources/pic/DLedger-index-construct.png)
 
-索引条目固定32字节。
+字段值与data一致，索引条目固定32字节。
 
 #### 实现类
 
@@ -4737,6 +4741,225 @@ public abstract class DLedgerStore {
   public void shutdown() {}
 }
 ```
+
+### 日志
+
+#### 写入
+
+集群选出Leader之后，集群中的主节点可以接受客户端的请求（日志写入到 PageCache），而==集群中的从节点只负责同步数据，而不会处理读写请求==，与M-S结构的读写分离有着巨大的区别。
+
+##### handleAppend
+
+Leader处理日志写入请求的入口：`io.openmessaging.storage.dledger.DLedgerServer#handleAppend`
+
+```java
+/**
+ * Handle the append requests:	处理日志追加请求
+ * 1.append the entry to local store	1. 将条目追加到本地存储
+ * 2.submit the future to entry pusher and wait the quorum ack 	2. 提交future到pusher，等待其合法ack
+ * 3.if the pending requests are full, then reject it immediately	3. 如果预处理的请求数已满，立即拒绝请求
+ *
+ * @param request
+ * @return
+ * @throws IOException
+ */
+@Override
+public CompletableFuture<AppendEntryResponse> handleAppend(AppendEntryRequest request) throws IOException {
+  try {
+		// 如果请求的节点ID不是当前处理节点，则抛出异常
+    PreConditions.check(memberState.getSelfId().equals(request.getRemoteId()), DLedgerResponseCode.UNKNOWN_MEMBER, "%s != %s", request.getRemoteId(), memberState.getSelfId());
+    // 如果请求的集群不是当前节点所在的集群，则抛出异常
+    PreConditions.check(memberState.getGroup().equals(request.getGroup()), DLedgerResponseCode.UNKNOWN_GROUP, "%s != %s", request.getGroup(), memberState.getGroup());
+    // 如果当前节点不是主节点，则抛出异常
+    PreConditions.check(memberState.isLeader(), DLedgerResponseCode.NOT_LEADER);
+    // Leader正在转移，抛出异常
+    PreConditions.check(memberState.getTransferee() == null, DLedgerResponseCode.LEADER_TRANSFERRING);
+    long currTerm = memberState.currTerm();
+    // 预处理队列已满，返回拒绝请求
+    if (dLedgerEntryPusher.isPendingFull(currTerm)) {
+      AppendEntryResponse appendEntryResponse = new AppendEntryResponse();
+      appendEntryResponse.setGroup(memberState.getGroup());
+      appendEntryResponse.setCode(DLedgerResponseCode.LEADER_PENDING_FULL.getCode());
+      appendEntryResponse.setTerm(currTerm);
+      appendEntryResponse.setLeaderId(memberState.getSelfId());
+      return AppendFuture.newCompletedFuture(-1, appendEntryResponse);
+    } else {
+      // 批量追加
+      if (request instanceof BatchAppendEntryRequest) {
+        BatchAppendEntryRequest batchRequest = (BatchAppendEntryRequest) request;
+        if (batchRequest.getBatchMsgs() != null && batchRequest.getBatchMsgs().size() != 0) {
+          // record positions to return;
+          // positions用来记录每一个entry追加后返回的偏移量
+          long[] positions = new long[batchRequest.getBatchMsgs().size()];
+          DLedgerEntry resEntry = null;
+          // split bodys to append
+          int index = 0;
+          Iterator<byte[]> iterator = batchRequest.getBatchMsgs().iterator();
+          // 遍历batch entry封装独立的DLedgerEntry，追加日志，记录偏移量
+          while (iterator.hasNext()) {
+            DLedgerEntry dLedgerEntry = new DLedgerEntry();
+            dLedgerEntry.setBody(iterator.next());
+            resEntry = dLedgerStore.appendAsLeader(dLedgerEntry);
+            positions[index++] = resEntry.getPos();
+          }
+          // only wait last entry ack is ok
+          // 批量等待副本节点的复制响应
+          BatchAppendFuture<AppendEntryResponse> batchAppendFuture =
+            (BatchAppendFuture<AppendEntryResponse>) dLedgerEntryPusher.waitAck(resEntry, true);
+          batchAppendFuture.setPositions(positions);
+          return batchAppendFuture;
+        }
+        throw new DLedgerException(DLedgerResponseCode.REQUEST_WITH_EMPTY_BODYS, "BatchAppendEntryRequest" +
+                                   " with empty bodys");
+      } else {
+        // 单个entry，封装成DLedgerEntry
+        DLedgerEntry dLedgerEntry = new DLedgerEntry();
+        dLedgerEntry.setBody(request.getBody());
+        // 追加日志
+        DLedgerEntry resEntry = dLedgerStore.appendAsLeader(dLedgerEntry);
+        // 等待副本节点复制响应
+        return dLedgerEntryPusher.waitAck(resEntry, false);
+      }
+    }
+  } catch (DLedgerException e) {
+    logger.error("[{}][HandleAppend] failed", memberState.getSelfId(), e);
+    AppendEntryResponse response = new AppendEntryResponse();
+    response.copyBaseInfo(request);
+    response.setCode(e.getCode().getCode());
+    response.setLeaderId(memberState.getLeaderId());
+    return AppendFuture.newCompletedFuture(-1, response);
+  }
+}
+```
+
+##### isPendingFull
+
+队列是否已满的逻辑：统计同一投票轮次下等待从节点返回结果的个数是否大于预设值10000。`io.openmessaging.storage.dledger.DLedgerEntryPusher#isPendingFull`
+
+```java
+public boolean isPendingFull(long currTerm) {
+  // 检查当前投票轮次是否在 PendingMap 中，如果不在，则初始化
+  // 其结构为：Map< Long/*投票轮次*/, ConcurrentMap<Long, TimeoutFuture<AppendEntryResponse>>
+  checkTermForPendingMap(currTerm, "isPendingFull");
+  // 检测当前等待从节点返回结果的个数是否超过其最大请求数量maxPendingRequests，默认10000
+  return pendingAppendResponsesByTerm.get(currTerm).size() > dLedgerConfig.getMaxPendingRequestsNum();
+}
+```
+
+##### appendAsLeader
+
+基于内存实现：DLedgerMemoryStore；基于文件实现DLedgerMmapFileStore。重点还是基于文件实现。`io.openmessaging.storage.dledger.store.file.DLedgerMmapFileStore#appendAsLeader`
+
+```java
+public DLedgerEntry appendAsLeader(DLedgerEntry entry) {
+  // 能否追加？Leader？磁盘满了？
+  // 磁盘满的依据：DLedger 的根目录或数据文件目录的使用率超过了允许使用的最大值，默认值为85%
+  PreConditions.check(memberState.isLeader(), DLedgerResponseCode.NOT_LEADER);
+  PreConditions.check(!isDiskFull, DLedgerResponseCode.DISK_FULL);
+  
+  // ByteBuffer是从ThreadLocal中获取，固定4M
+  ByteBuffer dataBuffer = localEntryBuffer.get();
+  ByteBuffer indexBuffer = localIndexBuffer.get();
+  // entry写入buffer，ByteBuffer每次使用都要clear一下
+  DLedgerEntryCoder.encode(entry, dataBuffer);
+  int entrySize = dataBuffer.remaining();
+  
+  // 状态机加锁
+  synchronized (memberState) {
+    // 二次校验
+    PreConditions.check(memberState.isLeader(), DLedgerResponseCode.NOT_LEADER, null);
+    PreConditions.check(memberState.getTransferee() == null, DLedgerResponseCode.LEADER_TRANSFERRING, null);
+    
+    // 为当前日志条目设置序号，即 entryIndex 与 entryTerm (投票轮次)。并将魔数、entryIndex、entryTerm 等写入到 bytebuffer 中
+    long nextIndex = ledgerEndIndex + 1;
+    entry.setIndex(nextIndex);
+    entry.setTerm(memberState.currTerm());
+    entry.setMagic(CURRENT_MAGIC);
+    DLedgerEntryCoder.setIndexTerm(dataBuffer, nextIndex, memberState.currTerm(), CURRENT_MAGIC);
+    
+    // 计算新的消息的起始偏移量，然后将该偏移量写入日志的 bytebuffer 中
+    long prePos = dataFileList.preAppend(dataBuffer.remaining());
+    entry.setPos(prePos);
+    PreConditions.check(prePos != -1, DLedgerResponseCode.DISK_ERROR, null);
+    DLedgerEntryCoder.setPos(dataBuffer, prePos);
+    
+    // 执行钩子函数
+    for (AppendHook writeHook : appendHooks) {
+      writeHook.doHook(entry, dataBuffer.slice(), DLedgerEntry.BODY_OFFSET);
+    }
+    
+    // 将data追加到 pagecache 中
+    long dataPos = dataFileList.append(dataBuffer.array(), 0, dataBuffer.remaining());
+    PreConditions.check(dataPos != -1, DLedgerResponseCode.DISK_ERROR, null);
+    PreConditions.check(dataPos == prePos, DLedgerResponseCode.DISK_ERROR, null);
+    // 构建index，并追加到 pagecache 中
+    DLedgerEntryCoder.encodeIndex(dataPos, entrySize, CURRENT_MAGIC, nextIndex, memberState.currTerm(), indexBuffer);
+    long indexPos = indexFileList.append(indexBuffer.array(), 0, indexBuffer.remaining(), false);
+    PreConditions.check(indexPos == entry.getIndex() * INDEX_UNIT_SIZE, DLedgerResponseCode.DISK_ERROR, null);
+    
+    if (logger.isDebugEnabled()) {
+      logger.info("[{}] Append as Leader {} {}", memberState.getSelfId(), entry.getIndex(), entry.getBody().length);
+    }
+    
+    // ledgerEndeIndex 加一（下一个条目）的序号
+    ledgerEndIndex++;
+    ledgerEndTerm = memberState.currTerm();
+    if (ledgerBeginIndex == -1) {
+      ledgerBeginIndex = ledgerEndIndex;
+    }
+    // 更新leader 节点的状态机的 ledgerEndIndex 与 ledgerEndTerm
+    updateLedgerEndIndexAndTerm();
+    return entry;
+  }
+}
+```
+
+##### waitAck
+
+Leader追加日志之后，日志复制到从节点并同步等待从节点的ack。
+
+```java
+public CompletableFuture<AppendEntryResponse> waitAck(DLedgerEntry entry, boolean isBatchWait) {
+  // 更新当前节点的 push 水位线
+  // 结构：Map<Long /* term */, Map<String /*peerId*/, Long /*entry index*/>，term -> id -> index
+  updatePeerWaterMark(entry.getTerm(), memberState.getSelfId(), entry.getIndex());
+  // 如果集群的节点个数为1，无需转发，直接返回成功结果
+  if (memberState.getPeerMap().size() == 1) {
+    AppendEntryResponse response = new AppendEntryResponse();
+    response.setGroup(memberState.getGroup());
+    response.setLeaderId(memberState.getSelfId());
+    response.setIndex(entry.getIndex());
+    response.setTerm(entry.getTerm());
+    response.setPos(entry.getPos());
+    if (isBatchWait) {
+      return BatchAppendFuture.newCompletedFuture(entry.getPos(), response);
+    }
+    return AppendFuture.newCompletedFuture(entry.getPos(), response);
+  } else {
+    checkTermForPendingMap(entry.getTerm(), "waitAck");
+    // 构建append响应Future并设置超时时间maxWaitAckTimeMs，默认值为：2500 ms
+    AppendFuture<AppendEntryResponse> future;
+    if (isBatchWait) {
+      future = new BatchAppendFuture<>(dLedgerConfig.getMaxWaitAckTimeMs());
+    } else {
+      future = new AppendFuture<>(dLedgerConfig.getMaxWaitAckTimeMs());
+    }
+    future.setPos(entry.getPos());
+    // 将构建的 Future 放入等待结果集合中pendingAppendResponsesByTerm, isPendingFull就用这个集合判定
+    CompletableFuture<AppendEntryResponse> old = pendingAppendResponsesByTerm.get(entry.getTerm()).put(entry.getIndex(), future);
+    if (old != null) {
+      logger.warn("[MONITOR] get old wait at index={}", entry.getIndex());
+    }
+    return future;
+  }
+}
+```
+
+#### 传播
+
+
+
+
 
 ## 消息轨迹
 
