@@ -5455,7 +5455,237 @@ private void doTruncate(long truncateIndex) throws Exception {
 
 ##### EntryHandler
 
+由上述EntryDispatcher可知，主节点负责向从服务器PUSH请求，从节点自然而然的要处理这些请求。EntryHandler用来处理这方面的工作，`EntryDispatcher extends ShutdownAbleThread`，当节点状态为从节点时激活。
 
+重要属性：
+
+```java
+// APPEND请求处理队列
+ConcurrentMap<Long, Pair<PushEntryRequest, CompletableFuture<PushEntryResponse>>> writeRequestMap = new ConcurrentHashMap<>();
+// COMMIT、COMPARE、TRUNCATE 相关请求
+BlockingQueue<Pair<PushEntryRequest, CompletableFuture<PushEntryResponse>>> compareOrTruncateRequests = new ArrayBlockingQueue<Pair<PushEntryRequest, CompletableFuture<PushEntryResponse>>>(100);
+```
+
+- handlePush
+
+该方法用来处理主节点会主动向从节点传播日志的网络请求数据。
+
+```java
+public CompletableFuture<PushEntryResponse> handlePush(PushEntryRequest request) throws Exception {
+    //The timeout should smaller than the remoting layer's request timeout
+    // 构建一个响应结果Future，默认超时时间 1s (超时时间设置应当少于主节点发送等待时间3s)
+    CompletableFuture<PushEntryResponse> future = new TimeoutFuture<>(1000);
+    switch (request.getType()) {
+        case APPEND:
+            if (request.isBatch()) {
+                PreConditions.check(request.getBatchEntry() != null && request.getCount() > 0, DLedgerResponseCode.UNEXPECTED_ARGUMENT);
+            } else {
+                PreConditions.check(request.getEntry() != null, DLedgerResponseCode.UNEXPECTED_ARGUMENT);
+            }
+            long index = request.getFirstEntryIndex();
+            // 如果是 APPEND 请求，放入到 writeRequestMap 集合中
+            // 如果已存在该数据结构，说明主节点重复推送，构建返回结果，其状态码为 REPEATED_PUSH。
+            // 放入到 writeRequestMap 中，由 doWork 方法定时去处理待写入的请求。
+            Pair<PushEntryRequest, CompletableFuture<PushEntryResponse>> old = writeRequestMap.putIfAbsent(index, new Pair<>(request, future));
+            if (old != null) {
+                logger.warn("[MONITOR]The index {} has already existed with {} and curr is {}", index, old.getKey().baseInfo(), request.baseInfo());
+                future.complete(buildResponse(request, DLedgerResponseCode.REPEATED_PUSH.getCode()));
+            }
+            break;
+        case COMMIT:
+            // COMMIT请求， 将请求存入compareOrTruncateRequests请求处理中，由doWork方法异步处理。
+            compareOrTruncateRequests.put(new Pair<>(request, future));
+            break;
+        case COMPARE:
+        case TRUNCATE:
+            // COMPARE或TRUNCATE请求，将待写入队列writeRequestMap清空
+            // 并将请求放入 compareOrTruncateRequests 请求队列中，由 doWork 方法异步处理
+            PreConditions.check(request.getEntry() != null, DLedgerResponseCode.UNEXPECTED_ARGUMENT);
+            writeRequestMap.clear();
+            compareOrTruncateRequests.put(new Pair<>(request, future));
+            break;
+        default:
+            logger.error("[BUG]Unknown type {} from {}", request.getType(), request.baseInfo());
+            future.complete(buildResponse(request, DLedgerResponseCode.UNEXPECTED_ARGUMENT.getCode()));
+            break;
+    }
+    wakeup();
+    return future;
+}
+```
+
+- doWork
+
+thread里面的run方法，不断从writeRequestMap和compareOrTruncateRequests队列中获取并处理请求。
+
+```java
+public void doWork() {
+    try {
+        // 当前不是从节点退出
+        if (!memberState.isFollower()) {
+            waitForRunning(1);
+            return;
+        }
+        
+        // compareOrTruncateRequests 队列不为空，说明有COMMIT、COMPARE、TRUNCATE 等请求，这类请求优先处理。
+        // peek和poll非阻塞方法
+        if (compareOrTruncateRequests.peek() != null) {
+            Pair<PushEntryRequest, CompletableFuture<PushEntryResponse>> pair = compareOrTruncateRequests.poll();
+            PreConditions.check(pair != null, DLedgerResponseCode.UNKNOWN);
+            switch (pair.getKey().getType()) {
+                case TRUNCATE:
+                    handleDoTruncate(pair.getKey().getEntry().getIndex(), pair.getKey(), pair.getValue());
+                    break;
+                case COMPARE:
+                    handleDoCompare(pair.getKey().getEntry().getIndex(), pair.getKey(), pair.getValue());
+                    break;
+                case COMMIT:
+                    handleDoCommit(pair.getKey().getCommitIndex(), pair.getKey(), pair.getValue());
+                    break;
+                default:
+                    break;
+            }
+        } else {
+            // APPEND请求，从存储文件中获取当前最大的index，
+            // 并尝试从 writeRequestMap 容器中，获取下一个消息复制请求(ledgerEndIndex + 1) 为key去查找
+            // 如果不为空，则执行 doAppend 请求，如果为空，则调用checkAbnormalFuture来处理异常情况
+            long nextIndex = dLedgerStore.getLedgerEndIndex() + 1;
+            Pair<PushEntryRequest, CompletableFuture<PushEntryResponse>> pair = writeRequestMap.remove(nextIndex);
+            if (pair == null) {
+                checkAbnormalFuture(dLedgerStore.getLedgerEndIndex());
+                waitForRunning(1);
+                return;
+            }
+            PushEntryRequest request = pair.getKey();
+            if (request.isBatch()) {
+                handleDoBatchAppend(nextIndex, request, pair.getValue());
+            } else {
+                handleDoAppend(nextIndex, request, pair.getValue());
+            }
+        }
+    } catch (Throwable t) {
+        DLedgerEntryPusher.logger.error("Error in {}", getName(), t);
+        DLedgerUtils.sleep(100);
+    }
+}
+```
+
+- handleDoCommit
+
+```java
+private CompletableFuture<PushEntryResponse> handleDoCommit(long committedIndex, PushEntryRequest request,
+    CompletableFuture<PushEntryResponse> future) {
+    try {
+        PreConditions.check(committedIndex == request.getCommitIndex(), DLedgerResponseCode.UNKNOWN);
+        PreConditions.check(request.getType() == PushEntryRequest.Type.COMMIT, DLedgerResponseCode.UNKNOWN);
+        // 更新已提交的index
+        dLedgerStore.updateCommittedIndex(request.getTerm(), committedIndex);
+        future.complete(buildResponse(request, DLedgerResponseCode.SUCCESS.getCode()));
+    } catch (Throwable t) {
+        logger.error("[HandleDoCommit] committedIndex={}", request.getCommitIndex(), t);
+        future.complete(buildResponse(request, DLedgerResponseCode.UNKNOWN.getCode()));
+    }
+    return future;
+}
+
+// term：主节点当前的投票轮次
+// newCommittedIndex：主节点发送日志复制请求时的已提交日志序号
+public void updateCommittedIndex(long term, long newCommittedIndex) {
+    // 如果待更新提交序号为 -1 或 投票轮次小于从节点的投票轮次或主节点投票轮次等于从节点的已提交序号，则直接忽略本次提交动作
+    if (newCommittedIndex == -1
+        || ledgerEndIndex == -1
+        || term < memberState.currTerm()
+        || newCommittedIndex == this.committedIndex) {
+        return;
+    }
+    // 如果主节点的已提交日志序号小于从节点的已提交日志序号
+    // 或待提交序号小于当前节点的最小有效日志序号，则输出警告日志[MONITOR]，并忽略本次提交动作
+    if (newCommittedIndex < this.committedIndex
+        || newCommittedIndex < this.ledgerBeginIndex) {
+        logger.warn("[MONITOR]Skip update committed index for new={} < old={} or new={} < beginIndex={}", newCommittedIndex, this.committedIndex, newCommittedIndex, this.ledgerBeginIndex);
+        return;
+    }
+    // 如果从节点落后主节点太多，则重置提交索引为从节点当前最大有效日志序号
+    long endIndex = ledgerEndIndex;
+    if (newCommittedIndex > endIndex) {
+        //If the node fall behind too much, the committedIndex will be larger than enIndex.
+        newCommittedIndex = endIndex;
+    }
+    // 尝试根据待提交序号从从节点查找数据，如果数据不存在，则抛出 DISK_ERROR 错误
+    Pair<Long, Integer> posAndSize = getEntryPosAndSize(newCommittedIndex);
+    PreConditions.check(posAndSize != null, DLedgerResponseCode.DISK_ERROR);
+    // 更新commitedIndex、committedPos两个指针
+    // DledgerStore会定时将已提交指针刷入checkpoint文件，达到持久化commitedIndex指针的目的
+    this.committedIndex = newCommittedIndex;
+    this.committedPos = posAndSize.getKey() + posAndSize.getValue();
+}
+```
+
+- handleDoCompare
+
+主要也是返回当前从节点的 ledgerBeginIndex、ledgerEndIndex 以及投票轮次，供主节点进行判断比较。
+
+返回SUCCESS情况：request.entry 与 从节点存储的compareIndex的entry相同
+
+```java
+private CompletableFuture<PushEntryResponse> handleDoCompare(long compareIndex, PushEntryRequest request,
+    CompletableFuture<PushEntryResponse> future) {
+    try {
+        PreConditions.check(compareIndex == request.getEntry().getIndex(), DLedgerResponseCode.UNKNOWN);
+        PreConditions.check(request.getType() == PushEntryRequest.Type.COMPARE, DLedgerResponseCode.UNKNOWN);
+        DLedgerEntry local = dLedgerStore.get(compareIndex);
+        PreConditions.check(request.getEntry().equals(local), DLedgerResponseCode.INCONSISTENT_STATE);
+        future.complete(buildResponse(request, DLedgerResponseCode.SUCCESS.getCode()));
+    } catch (Throwable t) {
+        logger.error("[HandleDoCompare] compareIndex={}", compareIndex, t);
+        future.complete(buildResponse(request, DLedgerResponseCode.INCONSISTENT_STATE.getCode()));
+    }
+    return future;
+}
+```
+
+- handleDoTruncate
+
+调用`dLedgerStore.truncate()`方法：删除从节点上truncateIndex日志序号之后的所有日志。实现：删除从节点上 truncateIndex 日志序号之后的所有日志。
+
+```java
+private CompletableFuture<PushEntryResponse> handleDoTruncate(long truncateIndex, PushEntryRequest request,
+    CompletableFuture<PushEntryResponse> future) {
+    try {
+        logger.info("[HandleDoTruncate] truncateIndex={} pos={}", truncateIndex, request.getEntry().getPos());
+        PreConditions.check(truncateIndex == request.getEntry().getIndex(), DLedgerResponseCode.UNKNOWN);
+        PreConditions.check(request.getType() == PushEntryRequest.Type.TRUNCATE, DLedgerResponseCode.UNKNOWN);
+        long index = dLedgerStore.truncate(request.getEntry(), request.getTerm(), request.getLeaderId());
+        PreConditions.check(index == truncateIndex, DLedgerResponseCode.INCONSISTENT_STATE);
+        future.complete(buildResponse(request, DLedgerResponseCode.SUCCESS.getCode()));
+        dLedgerStore.updateCommittedIndex(request.getTerm(), request.getCommitIndex());
+    } catch (Throwable t) {
+        logger.error("[HandleDoTruncate] truncateIndex={}", truncateIndex, t);
+        future.complete(buildResponse(request, DLedgerResponseCode.INCONSISTENT_STATE.getCode()));
+    }
+    return future;
+}
+```
+
+- handleDoAppend
+
+其实现也比较简单，调用DLedgerStore 的 appendAsFollower 方法进行日志的追加，与appendAsLeader 在日志存储部分相同，只是从节点无需再转发日志。
+
+```java
+private void handleDoAppend(long writeIndex, PushEntryRequest request,
+    CompletableFuture<PushEntryResponse> future) {
+    try {
+        PreConditions.check(writeIndex == request.getEntry().getIndex(), DLedgerResponseCode.INCONSISTENT_STATE);
+        DLedgerEntry entry = dLedgerStore.appendAsFollower(request.getEntry(), request.getTerm(), request.getLeaderId());
+        PreConditions.check(entry.getIndex() == writeIndex, DLedgerResponseCode.INCONSISTENT_STATE);
+        future.complete(buildResponse(request, DLedgerResponseCode.SUCCESS.getCode()));
+        dLedgerStore.updateCommittedIndex(request.getTerm(), request.getCommitIndex());
+    } catch (Throwable t) {
+        logger.error("[HandleDoWrite] writeIndex={}", writeIndex, t);
+        future.complete(buildResponse(request, DLedgerResponseCode.INCONSISTENT_STATE.getCode()));
+    }
+}
+```
 
 ## 消息轨迹
 
