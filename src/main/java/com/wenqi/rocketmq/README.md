@@ -1156,6 +1156,12 @@ public interface LatencyFaultTolerance<T> {
 
 ## 消息存储
 
+- 优秀博客
+
+RocketMQ消息存储：https://baiyp.ren/RocketMQ%E6%B6%88%E6%81%AF%E5%AD%98%E5%82%A8.html
+
+- 流程图
+
 ![消息处理流程](https://s2.loli.net/2022/05/21/i6O1RacIAqCBjmM.png)
 
 #### 存储流程
@@ -4979,8 +4985,6 @@ private Map<Long, ConcurrentMap<String, Long>> peerWaterMarksByTerm = new Concur
 private Map<Long, ConcurrentMap<Long, TimeoutFuture<AppendEntryResponse>>> pendingAppendResponsesByTerm = new ConcurrentHashMap<>();
 ```
 
-
-
 ##### DLedgerEntryPusher
 
 - 构造器
@@ -5684,6 +5688,261 @@ private void handleDoAppend(long writeIndex, PushEntryRequest request,
         logger.error("[HandleDoWrite] writeIndex={}", writeIndex, t);
         future.complete(buildResponse(request, DLedgerResponseCode.INCONSISTENT_STATE.getCode()));
     }
+}
+```
+
+- checkAbnormalFuture
+
+尝试从待写请求中（`writeRequestMap`）获取不到对应的请求时调用，这种情况很常见。
+
+该方法作用：向主节点报告从节点已经与主节点发生了数据不一致，从节点并没有写入序号 minFastForwardIndex 的日志。如果主节点收到此种响应，将会停止日志转发，转而向各个从节点发送 COMPARE 请求，从而使数据恢复一致。
+
+```java
+/**
+ * The leader does push entries to follower, and record the pushed index. But in the following conditions, the push may get stopped.
+ *   * If the follower is abnormally shutdown, its ledger end index may be smaller than before. At this time, the leader may push fast-forward entries, and retry all the time.
+ *   * If the last ack is missed, and no new message is coming in.The leader may retry push the last message, but the follower will ignore it.
+ * @param endIndex = ledgerEndIndex + 1
+ */
+private void checkAbnormalFuture(long endIndex) {
+  	// 如果上一次检查的时间距现在不到1s，则跳出；
+  	// 如果当前没有积压的append请求，同样跳出;
+  	// 因为可以同样明确的判断出主节点还未推送日志
+    if (DLedgerUtils.elapsed(lastCheckFastForwardTimeMs) < 1000) {
+        return;
+    }
+    lastCheckFastForwardTimeMs  = System.currentTimeMillis();
+    if (writeRequestMap.isEmpty()) {
+        return;
+    }
+		// 见下述
+    checkAppendFuture(endIndex);
+}
+
+// 遍历当前待写入的日志追加请求(主服务器推送过来的日志复制请求)，找到需要快速快进minFastForwardIndex的的索引
+private void checkAppendFuture(long endIndex) {
+  long minFastForwardIndex = Long.MAX_VALUE;
+  // 自身存储的index与对比Leader发送的写入日志的请求进行对比
+  // 如果writeRequestMap中存在index < ledgerEndIndex + 1, 则移除writeRequestMap中该index请求
+  // 如果发现writeRequestMap中Entry与存储的Entry不一致，构造返回码DLedgerResponseCode.INCONSISTENT_STATE.getCode()
+  for (Pair<PushEntryRequest, CompletableFuture<PushEntryResponse>> pair : writeRequestMap.values()) {
+    long firstEntryIndex = pair.getKey().getFirstEntryIndex();
+    long lastEntryIndex = pair.getKey().getLastEntryIndex();
+    //Fall behind
+    // writeRequestMap中index < ledgerEndIndex + 1
+    if (lastEntryIndex <= endIndex) {
+      try {
+        if (pair.getKey().isBatch()) {
+          for (DLedgerEntry dLedgerEntry : pair.getKey().getBatchEntry()) {
+            // entry对比
+            PreConditions.check(dLedgerEntry.equals(dLedgerStore.get(dLedgerEntry.getIndex())), DLedgerResponseCode.INCONSISTENT_STATE);
+          }
+        } else {
+          DLedgerEntry dLedgerEntry = pair.getKey().getEntry();
+          // entry对比
+          PreConditions.check(dLedgerEntry.equals(dLedgerStore.get(dLedgerEntry.getIndex())), DLedgerResponseCode.INCONSISTENT_STATE);
+        }
+        pair.getValue().complete(buildBatchAppendResponse(pair.getKey(), DLedgerResponseCode.SUCCESS.getCode()));
+        logger.warn("[PushFallBehind]The leader pushed an batch append entry last index={} smaller than current ledgerEndIndex={}, maybe the last ack is missed", lastEntryIndex, endIndex);
+      } catch (Throwable t) {
+        logger.error("[PushFallBehind]The leader pushed an batch append entry last index={} smaller than current ledgerEndIndex={}, maybe the last ack is missed", lastEntryIndex, endIndex, t);
+        pair.getValue().complete(buildBatchAppendResponse(pair.getKey(), DLedgerResponseCode.INCONSISTENT_STATE.getCode()));
+      }
+      // 移除
+      writeRequestMap.remove(pair.getKey().getFirstEntryIndex());
+      continue;
+    }
+    
+    // 如果待写入 index 等于endIndex + 1，则结束循环，因为下一条日志消息已经在待写入队列中，即将写入
+    if (firstEntryIndex == endIndex + 1) {
+      return;
+    }
+    
+    // 如果待写入 index 大于 endIndex + 1，并且未超时，则直接检查下一条待写入日志
+    TimeoutFuture<PushEntryResponse> future = (TimeoutFuture<PushEntryResponse>) pair.getValue();
+    if (!future.isTimeOut()) {
+      continue;
+    }
+    
+    // 如果待写入 index 大于 endIndex + 1，并且已经超时，则记录该索引，使用 minFastForwardIndex 存储
+    if (firstEntryIndex < minFastForwardIndex) {
+      minFastForwardIndex = firstEntryIndex;
+    }
+  }
+  
+  // 如果未找到需要快速失败的日志序号或 writeRequestMap 中未找到其请求，则直接结束检测
+  if (minFastForwardIndex == Long.MAX_VALUE) {
+    return;
+  }
+  Pair<PushEntryRequest, CompletableFuture<PushEntryResponse>> pair = writeRequestMap.get(minFastForwardIndex);
+  if (pair == null) {
+    return;
+  }
+  logger.warn("[PushFastForward] ledgerEndIndex={} entryIndex={}", endIndex, minFastForwardIndex);
+  pair.getValue().complete(buildBatchAppendResponse(pair.getKey(), DLedgerResponseCode.INCONSISTENT_STATE.getCode()));
+}
+```
+
+##### QuorumAckChecker
+
+日志复制投票器，`extends ShutdownAbleThread`，一个日志写请求只有得到集群内的的大多数节点的响应，日志才会被提交。
+
+- 重要属性
+
+```java
+// 上次打印水位线的时间戳，单位为毫秒
+private long lastPrintWatermarkTimeMs = System.currentTimeMillis();
+// 上次检测泄漏的时间戳，单位为毫秒
+private long lastCheckLeakTimeMs = System.currentTimeMillis();
+// 已投票仲裁的日志序号
+private long lastQuorumIndex = -1;
+```
+
+- run方法
+
+```java
+public void doWork() {
+  //=============================== 分割线 ===============================//
+  try {
+    // 如果离上一次打印 watermak 的时间超过3s，则打印一下当前的 term、ledgerBegin、ledgerEnd、committed、peerWaterMarksByTerm 这些数据日志
+    if (DLedgerUtils.elapsed(lastPrintWatermarkTimeMs) > 3000) {
+      logger.info("[{}][{}] term={} ledgerBegin={} ledgerEnd={} committed={} watermarks={}",
+                  memberState.getSelfId(), memberState.getRole(), memberState.currTerm(), dLedgerStore.getLedgerBeginIndex(), dLedgerStore.getLedgerEndIndex(), dLedgerStore.getCommittedIndex(), JSON.toJSONString(peerWaterMarksByTerm));
+      lastPrintWatermarkTimeMs = System.currentTimeMillis();
+    }
+    // 不是Leader直接返回，Leader才能仲裁
+    if (!memberState.isLeader()) {
+      waitForRunning(1);
+      return;
+    }
+    long currTerm = memberState.currTerm();
+    checkTermForPendingMap(currTerm, "QuorumAckChecker");
+    checkTermForWaterMark(currTerm, "QuorumAckChecker");
+    
+    //=============================== 分割线 ===============================//
+		
+    // 清理pendingAppendResponsesByTerm、peerWaterMarksByTerm中非本次投票轮次的数据，避免一些不必要的内存使用
+    if (pendingAppendResponsesByTerm.size() > 1) {
+      for (Long term : pendingAppendResponsesByTerm.keySet()) {
+        if (term == currTerm) {
+          continue;
+        }
+        for (Map.Entry<Long, TimeoutFuture<AppendEntryResponse>> futureEntry : pendingAppendResponsesByTerm.get(term).entrySet()) {
+          AppendEntryResponse response = new AppendEntryResponse();
+          response.setGroup(memberState.getGroup());
+          response.setIndex(futureEntry.getKey());
+          response.setCode(DLedgerResponseCode.TERM_CHANGED.getCode());
+          response.setLeaderId(memberState.getLeaderId());
+          logger.info("[TermChange] Will clear the pending response index={} for term changed from {} to {}", futureEntry.getKey(), term, currTerm);
+          futureEntry.getValue().complete(response);
+        }
+        pendingAppendResponsesByTerm.remove(term);
+      }
+    }
+    if (peerWaterMarksByTerm.size() > 1) {
+      for (Long term : peerWaterMarksByTerm.keySet()) {
+        if (term == currTerm) {
+          continue;
+        }
+        logger.info("[TermChange] Will clear the watermarks for term changed from {} to {}", term, currTerm);
+        peerWaterMarksByTerm.remove(term);
+      }
+    }
+    
+    //=============================== 分割线 ===============================//
+    
+    /**
+     * peerWaterMarks的结构:
+     * {
+     *      “dledger_group_01_0” : 100,
+     *      "dledger_group_01_1" : 101,
+     * }
+     *  dledger_group_01_0 为从节点1的ID，当前已复制的序号为 100
+     *  dledger_group_01_1 为从节点2的ID，当前已复制的序号为 101
+     *	
+     * 	集群内超过半数的节点的已复制序号超过该值，则该日志能被确认提交
+     */
+    Map<String, Long> peerWaterMarks = peerWaterMarksByTerm.get(currTerm);
+    // 获取所有节点的日子复制进度，倒序排序（注意：开始相同term所有节点的复制进度都是一样，比如100，如果日志复制成功就+1，比如101
+    List<Long> sortedWaterMarks = peerWaterMarks.values()
+                                                .stream()
+                                                .sorted(Comparator.reverseOrder())
+                                                .collect(Collectors.toList());
+    // 取数组的中间位置的日志复制进度：此位置可以说明集群内半数的日志复制进度是怎样的，比如100（未超半数），或者101（超半数）
+    long quorumIndex = sortedWaterMarks.get(sortedWaterMarks.size() / 2);
+    // 更新当前集群日志复制进度
+    dLedgerStore.updateCommittedIndex(currTerm, quorumIndex);
+    ConcurrentMap<Long, TimeoutFuture<AppendEntryResponse>> responses = pendingAppendResponsesByTerm.get(currTerm);
+    boolean needCheck = false;
+    int ackNum = 0;
+    // 从pendingAppendResponsesByTerm中，移除已提交quorumIndex之前的挂起的请求
+    for (Long i = quorumIndex; i > lastQuorumIndex; i--) {
+      try {
+        CompletableFuture<AppendEntryResponse> future = responses.remove(i);
+        // 如果未找到挂起请求，说明前面挂起的请求已经全部处理完毕，准备退出，退出之前再 设置 needCheck 的值
+        if (future == null) {
+          needCheck = true;
+          break;
+        } else if (!future.isDone()) {
+          AppendEntryResponse response = new AppendEntryResponse();
+          response.setGroup(memberState.getGroup());
+          response.setTerm(currTerm);
+          response.setIndex(i);
+          response.setLeaderId(memberState.getSelfId());
+          response.setPos(((AppendFuture) future).getPos());
+          future.complete(response);
+        }
+        ackNum++;
+      } catch (Throwable t) {
+        logger.error("Error in ack to index={} term={}", i, currTerm, t);
+      }
+    }
+
+    // 如果本次确认的个数为0，则尝试去判断超过该仲裁序号的请求，是否已经超时，如果已超时，则返回超时响应结果
+    if (ackNum == 0) {
+      for (long i = quorumIndex + 1; i < Integer.MAX_VALUE; i++) {
+        TimeoutFuture<AppendEntryResponse> future = responses.get(i);
+        if (future == null) {
+          break;
+        } else if (future.isTimeOut()) {
+          AppendEntryResponse response = new AppendEntryResponse();
+          response.setGroup(memberState.getGroup());
+          response.setCode(DLedgerResponseCode.WAIT_QUORUM_ACK_TIMEOUT.getCode());
+          response.setTerm(currTerm);
+          response.setIndex(i);
+          response.setLeaderId(memberState.getSelfId());
+          future.complete(response);
+        } else {
+          break;
+        }
+      }
+      waitForRunning(1);
+    }
+
+    // 检查是否发送泄漏。其判断泄漏的依据是如果挂起的请求的日志序号小于已提交的序号，则移除
+    if (DLedgerUtils.elapsed(lastCheckLeakTimeMs) > 1000 || needCheck) {
+      updatePeerWaterMark(currTerm, memberState.getSelfId(), dLedgerStore.getLedgerEndIndex());
+      for (Map.Entry<Long, TimeoutFuture<AppendEntryResponse>> futureEntry : responses.entrySet()) {
+        if (futureEntry.getKey() < quorumIndex) {
+          AppendEntryResponse response = new AppendEntryResponse();
+          response.setGroup(memberState.getGroup());
+          response.setTerm(currTerm);
+          response.setIndex(futureEntry.getKey());
+          response.setLeaderId(memberState.getSelfId());
+          response.setPos(((AppendFuture) futureEntry.getValue()).getPos());
+          futureEntry.getValue().complete(response);
+          responses.remove(futureEntry.getKey());
+        }
+      }
+      lastCheckLeakTimeMs = System.currentTimeMillis();
+    }
+    
+    // b次日志仲裁就结束了，最后更新 lastQuorumIndex 为本次仲裁的的新的提交值
+    lastQuorumIndex = quorumIndex;
+  } catch (Throwable t) {
+    DLedgerEntryPusher.logger.error("Error in {}", getName(), t);
+    DLedgerUtils.sleep(100);
+  }
 }
 ```
 
