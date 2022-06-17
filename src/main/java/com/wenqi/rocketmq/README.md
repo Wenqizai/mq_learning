@@ -5397,15 +5397,25 @@ private void doAppend() throws Exception {
             lastCheckLeakTimeMs = System.currentTimeMillis();
         }
         
-        // 如果挂起的请求（等待从节点追加结果）大于 maxPendingSize 时，检查并追加一次 append 请求
+        // 如果挂起的请求（等待从节点追加结果）大于 maxPendingSize 时，检查并重发超时的append请求
         if (pendingMap.size() >= maxPendingSize) {
-            // 里面调用doAppendInner
+            // 里面调用doAppendInner，检查是否有超时请求，重新发送
             doCheckAppendResponse();
             break;
         }
         // 追加请求
         doAppendInner(writeIndex);
         writeIndex++;
+    }
+}
+
+// 下一条日志的推送请求已经超时，则重新发起推送请求，即重新发送日志，避免网络丢包等异常
+private void doCheckAppendResponse() throws Exception {
+    long peerWaterMark = getPeerWaterMark(term, peerId);
+    Long sendTimeMs = pendingMap.get(peerWaterMark + 1);
+    if (sendTimeMs != null && System.currentTimeMillis() - sendTimeMs > dLedgerConfig.getMaxPushTimeOutMs()) {
+        logger.warn("[Push-{}]Retry to push entry at {}", peerId, peerWaterMark + 1);
+        doAppendInner(peerWaterMark + 1);
     }
 }
 ```
@@ -5455,14 +5465,16 @@ private PushEntryRequest buildPushRequest(DLedgerEntry entry, PushEntryRequest.T
 
 - doCheckAppendResponse
 
-该方法的作用是检查 append 请求是否超时，保存已成功发送的时间
+如果因网络等原因，主节点在向从节点追加日志时失败，该如何保证从节点与主节点一致呢？
+
+从上文我们可以得知，Leader节点在向从节点转发日志后，会存储该日志的推送时间戳到`pendingMap`，其存储结构为`ConcurrentMap<Long/*日志序号*/, Long/*PUSH时间戳*/> pendingMap`。当`pendingMap`的积压超过1000时会触发重推机制（doAppend逻辑里检查），该逻辑封装在`doCheckAppendResponse()`方法中。
 
 ```java
 private void doCheckAppendResponse() throws Exception {
     // 获取已成功append的序号
     long peerWaterMark = getPeerWaterMark(term, peerId);
-    // 从挂起的请求队列中获取已成功发送的下一条的发送时间
-    // 如果不为空并去超过了append的超时时间，则再重新发送append请求，最大超时时间默认为 1s，可以通过maxPushTimeOutMs来改变默认值。
+    // 从挂起的请求队列pendingMap中获取已成功发送的下一条的发送时间
+    // 如果找到日志记录并且超过了append的超时时间，则再重新发送append请求，最大超时时间默认为 1s，可以通过maxPushTimeOutMs来改变默认值。
     Long sendTimeMs = pendingMap.get(peerWaterMark + 1);
     if (sendTimeMs != null && System.currentTimeMillis() - sendTimeMs > dLedgerConfig.getMaxPushTimeOutMs()) {
         logger.warn("[Push-{}]Retry to push entry at {}", peerId, peerWaterMark + 1);
@@ -5495,11 +5507,11 @@ private void doAppendInner(long index) throws Exception {
             switch (responseCode) {
                 // 请求成功
                 case SUCCESS:
-                   	// 移除 pendingMap 中的关于该日志的发送超时时间
+                   	// 移除pendingMap中的对应的日志条目，标识已经成功收到响应结果
                     pendingMap.remove(x.getIndex());
                     // 更新已成功追加的日志序号(按投票轮次组织，并且每个从服务器一个键值对)
                     updatePeerWaterMark(x.getTerm(), peerId, x.getIndex());
-                    // 唤醒 quorumAckChecker 线程(主要用于仲裁 append 结果)
+                    // 唤醒quorumAckChecker线程(主要用于仲裁 append 结果)
                     quorumAckChecker.wakeup();
                     break;
                 // Push请求出现状态不一致情况
@@ -5534,7 +5546,7 @@ private void checkQuotaAndWait(DLedgerEntry entry) {
     if (mmapFileStore.getDataFileList().getMaxWrotePosition() - entry.getPos() < dLedgerConfig.getPeerPushThrottlePoint()) {
         return;
     }
-    // 每秒追加的日志超过 20m(可通过peerPushQuota配置)，则会sleep1s中后再追加, 限流
+    // 每秒追加的日志超过 20m(可通过peerPushQuota配置)，则会sleep 1s中后再追加, 限流
     quota.sample(entry.getSize());
     if (quota.validateNow()) {
         long leftNow = quota.leftNow();
@@ -5661,9 +5673,9 @@ private void doCompare() throws Exception {
 }
 ```
 
-- doTruncate 
+- doTruncate
 
-该方法主要就是构建 truncate 请求到从节点。
+该方法主要就是构建 truncate 请求到从节点，从节点收到请求后会清理多余数据，使主从节点数据保持一致。日志转发器在处理完truncate请求后，状态将变更为APPEND，开始向从节点转发日志。
 
 ```java
 private void doTruncate(long truncateIndex) throws Exception {
@@ -5671,11 +5683,13 @@ private void doTruncate(long truncateIndex) throws Exception {
     DLedgerEntry truncateEntry = dLedgerStore.get(truncateIndex);
     PreConditions.check(truncateEntry != null, DLedgerResponseCode.UNKNOWN);
     logger.info("[Push-{}]Will push data to truncate truncateIndex={} pos={}", peerId, truncateIndex, truncateEntry.getPos());
+    // 构建并发送truncate请求
     PushEntryRequest truncateRequest = buildPushRequest(truncateEntry, PushEntryRequest.Type.TRUNCATE);
     PushEntryResponse truncateResponse = dLedgerRpcService.push(truncateRequest).get(3, TimeUnit.SECONDS);
     PreConditions.check(truncateResponse != null, DLedgerResponseCode.UNKNOWN, "truncateIndex=%d", truncateIndex);
     PreConditions.check(truncateResponse.getCode() == DLedgerResponseCode.SUCCESS.getCode(), DLedgerResponseCode.valueOf(truncateResponse.getCode()), "truncateIndex=%d", truncateIndex);
     lastPushCommitTimeMs = System.currentTimeMillis();
+    // 更改状态
     changeState(truncateIndex, PushEntryRequest.Type.APPEND);
 }
 ```
@@ -5687,6 +5701,8 @@ private void doTruncate(long truncateIndex) throws Exception {
 重要属性：
 
 ```java
+// 上一次检查主服务器是否有推送消息的时间戳
+private long lastCheckFastForwardTimeMs = System.currentTimeMillis();
 // APPEND请求处理队列
 ConcurrentMap<Long, Pair<PushEntryRequest, CompletableFuture<PushEntryResponse>>> writeRequestMap = new ConcurrentHashMap<>();
 // COMMIT、COMPARE、TRUNCATE 相关请求
@@ -5695,7 +5711,9 @@ BlockingQueue<Pair<PushEntryRequest, CompletableFuture<PushEntryResponse>>> comp
 
 - handlePush
 
-该方法用来处理主节点会主动向从节点传播日志的网络请求数据。
+`io.openmessaging.storage.dledger.DLedgerEntryPusher.EntryHandler#handlePush`，该方法用来处理主节点会主动向从节点传播日志的网络请求数据（无论是`APPEND`, `COMMIT`, `COMPARE`, `TRUNCATE`）。
+
+`APPEND`写入队列`writeRequestMap`，`COMMIT/COMPARE/TRUNCATE`写入队列`compareOrTruncateRequests`。
 
 ```java
 public CompletableFuture<PushEntryResponse> handlePush(PushEntryRequest request) throws Exception {
@@ -5850,9 +5868,10 @@ public void updateCommittedIndex(long term, long newCommittedIndex) {
 
 - handleDoCompare
 
-主要也是返回当前从节点的 ledgerBeginIndex、ledgerEndIndex 以及投票轮次，供主节点进行判断比较。
+Leader节点首先会向从节点发送compare请求，来比较两者的数据是否存在差异。该方法主要也是返回当前从节点的 ledgerBeginIndex、ledgerEndIndex 以及投票轮次，供主节点进行判断比较。
 
-返回SUCCESS情况：request.entry 与 从节点存储的compareIndex的entry相同
+> 1. 返回INCONSISTENT_STATE：主从节点的Entry不一致，返回响应的index，方便Leader比较截取；
+> 2. 返回SUCCESS：request.entry 与 从节点存储的compareIndex的entry相同。
 
 ```java
 private CompletableFuture<PushEntryResponse> handleDoCompare(long compareIndex, PushEntryRequest request,
@@ -5882,9 +5901,11 @@ private CompletableFuture<PushEntryResponse> handleDoTruncate(long truncateIndex
         logger.info("[HandleDoTruncate] truncateIndex={} pos={}", truncateIndex, request.getEntry().getPos());
         PreConditions.check(truncateIndex == request.getEntry().getIndex(), DLedgerResponseCode.UNKNOWN);
         PreConditions.check(request.getType() == PushEntryRequest.Type.TRUNCATE, DLedgerResponseCode.UNKNOWN);
+        // 日志删除操作
         long index = dLedgerStore.truncate(request.getEntry(), request.getTerm(), request.getLeaderId());
         PreConditions.check(index == truncateIndex, DLedgerResponseCode.INCONSISTENT_STATE);
         future.complete(buildResponse(request, DLedgerResponseCode.SUCCESS.getCode()));
+        // commit
         dLedgerStore.updateCommittedIndex(request.getTerm(), request.getCommitIndex());
     } catch (Throwable t) {
         logger.error("[HandleDoTruncate] truncateIndex={}", truncateIndex, t);
@@ -5929,12 +5950,11 @@ private void handleDoAppend(long writeIndex, PushEntryRequest request,
  */
 private void checkAbnormalFuture(long endIndex) {
   	// 如果上一次检查的时间距现在不到1s，则跳出；
-  	// 如果当前没有积压的append请求，同样跳出;
-  	// 因为可以同样明确的判断出主节点还未推送日志
     if (DLedgerUtils.elapsed(lastCheckFastForwardTimeMs) < 1000) {
         return;
     }
     lastCheckFastForwardTimeMs  = System.currentTimeMillis();
+    // 如果当前没有积压的append请求，同样跳出, 因为可以同样明确的判断出主节点还未推送日志
     if (writeRequestMap.isEmpty()) {
         return;
     }
@@ -5976,18 +5996,22 @@ private void checkAppendFuture(long endIndex) {
       continue;
     }
     
-    // 如果待写入 index 等于endIndex + 1，则结束循环，因为下一条日志消息已经在待写入队列中，即将写入
+     //Just OK
+    // 如果待写入index等于已存储endIndex + 1，则结束循环，表示从节点下一条期望追加的日志Leader节点刚刚推送过来了
     if (firstEntryIndex == endIndex + 1) {
       return;
     }
-    
-    // 如果待写入 index 大于 endIndex + 1，并且未超时，则直接检查下一条待写入日志
+      
+    //Fast forward
+    // 如果待写入index大于endIndex + 1，证明消息有积压情况
     TimeoutFuture<PushEntryResponse> future = (TimeoutFuture<PushEntryResponse>) pair.getValue();
+    // 该消息挂起未超时，则检查检查下一条待写入日志
     if (!future.isTimeOut()) {
       continue;
     }
     
-    // 如果待写入 index 大于 endIndex + 1，并且已经超时，则记录该索引，使用 minFastForwardIndex 存储
+    // 如果待写入index大于endIndex + 1，并且已经超时，说明该日志没有正常写入从节点
+    // 则记录已经超时的最小日志序号minFastForwardIndex，向主节点汇报
     if (firstEntryIndex < minFastForwardIndex) {
       minFastForwardIndex = firstEntryIndex;
     }
@@ -6001,6 +6025,8 @@ private void checkAppendFuture(long endIndex) {
   if (pair == null) {
     return;
   }
+  // 如果找到已经超时的待追加请求，则向Leader节点返回错误码INCONSISTENT_STATE，即快速失败机制，
+  // 尽快通知Leader节点与从节点进行数据比对，使主从数据保持一致性
   logger.warn("[PushFastForward] ledgerEndIndex={} entryIndex={}", endIndex, minFastForwardIndex);
   pair.getValue().complete(buildBatchAppendResponse(pair.getKey(), DLedgerResponseCode.INCONSISTENT_STATE.getCode()));
 }
@@ -6044,7 +6070,7 @@ public void doWork() {
     
     //=============================== 分割线 ===============================//
 		
-    // 清理pendingAppendResponsesByTerm、peerWaterMarksByTerm中非本次投票轮次的数据，避免一些不必要的内存使用
+    // 清理已过期挂起的请求pendingAppendResponsesByTerm(投票轮次与当前轮次不同), 避免一些不必要的内存使用
     if (pendingAppendResponsesByTerm.size() > 1) {
       for (Long term : pendingAppendResponsesByTerm.keySet()) {
         if (term == currTerm) {
@@ -6062,6 +6088,8 @@ public void doWork() {
         pendingAppendResponsesByTerm.remove(term);
       }
     }
+    // 清理已过期的日志复制水位线peerWaterMarksByTerm(投票轮次与当前轮次不同)
+    // Map<Long/*投票轮次*/, ConcurrentMap<String/*节点nodeId*/, Long/*从节点对应已存储日志序号*/>> peerWaterMarksByTerm
     if (peerWaterMarksByTerm.size() > 1) {
       for (Long term : peerWaterMarksByTerm.keySet()) {
         if (term == currTerm) {
