@@ -15,7 +15,8 @@ public class ScheduleMessageProducer {
         // 实例化一个生产者来产生延时消息
         DefaultMQProducer producer = new DefaultMQProducer("Schedule-Message-Producer");
         // 设置NameServer的地址
-        producer.setNamesrvAddr("10.0.88.8:9876");
+//        producer.setNamesrvAddr("10.0.88.8:9876");
+        producer.setNamesrvAddr("127.0.0.1:9876");
         // 启动生产者
         producer.start();
 

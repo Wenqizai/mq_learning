@@ -2356,6 +2356,7 @@ public void executeOnTimeup() {
             // 解析出消息的物理偏移量、消息长度、消息标志的哈希码，为从CommitLog文件加载具体的消息做准备
             long offsetPy = bufferCQ.getByteBuffer().getLong();
             int sizePy = bufferCQ.getByteBuffer().getInt();
+          	// 注意这个tagCode，不再是普通的tag的hashCode，而是该延时消息到期的时间
             long tagsCode = bufferCQ.getByteBuffer().getLong();
             if (cq.isExtAddr(tagsCode)) {
                 if (cq.getExt(tagsCode, cqExtUnit)) {
@@ -2367,6 +2368,8 @@ public void executeOnTimeup() {
                     tagsCode = computeDeliverTimestamp(delayLevel, msgStoreTime);
                 }
             }
+          
+          	// 比较时间戳，deliverTimestamp延时发送的时间戳，当未到延时发送时间时即countdown > 0，则放入下次调度任务，直接返回
             long now = System.currentTimeMillis();
             long deliverTimestamp = this.correctDeliverTimestamp(now, tagsCode);
             nextOffset = offset + (i / ConsumeQueue.CQ_STORE_UNIT_SIZE);
@@ -2382,7 +2385,7 @@ public void executeOnTimeup() {
                 continue;
             }
             
-		   // 根据消息属性重新构建新的消息对象，清除消息的延迟级别属性（delayLevel）
+		   			// 根据消息属性重新构建新的消息对象，清除消息的延迟级别属性（delayLevel）
             // 恢复消息原先的消息主题与消息消费队列，消息的消费次数reconsumeTimes并不会丢失
             MessageExtBrokerInner msgInner = ScheduleMessageService.this.messageTimeup(msgExt);
             if (TopicValidator.RMQ_SYS_TRANS_HALF_TOPIC.equals(msgInner.getTopic())) {
@@ -2420,12 +2423,68 @@ public void executeOnTimeup() {
 
 <img src="https://s2.loli.net/2022/05/21/4H5jGWFyxSvPRKD.png" alt="schedule-msg" style="zoom: 80%;" />
 
-1. 发送消息的`delayLevel`大于0，则将消息主题变更为`SCHEDULE_TOPIC_XXXX`，消息队列为`delayLevel`减1。（`org.apache.rocketmq.store.CommitLog#asyncPutMessage`）；
+1. 发送消息的`delayLevel`大于0，则将消息主题变更为`SCHEDULE_TOPIC_XXXX`，消息队列queueId为`delayLevel - 1`。（`org.apache.rocketmq.store.CommitLog#asyncPutMessage`）；
 2. 消息经由`CommitLog`文件转发到消息队列`SCHEDULE_TOPIC_XXXX`中；（根据Topic转发到每一个consume queue：`org.apache.rocketmq.store.DefaultMessageStore.CommitLogDispatcherBuildConsumeQueue#dispatch`）
 3. 定时任务Time每隔`1s`根据上次拉取偏移量从消费队列中取出所有消息；
 4. 根据消息的物理偏移量与消息大小从`CommitLog`文件中拉取消息。
 5. 根据消息属性重新创建消息，恢复原主题`topicA`、原队列ID，清除`delayLevel`属性，并存入`CommitLog`文件。
 6. 将消息转发到原主题`topicA`的消息消费队列，供消息消费者消费。
+
+###### 6.4 投递时机
+
+1. 主节点启动定时消息处理线程。`org.apache.rocketmq.store.MessageStore#handleScheduleMessageService`
+2. 构建定时任务线程池，每1秒钟检查所有的delayLevel是否有信息需要处理。`org.apache.rocketmq.store.schedule.ScheduleMessageService#start`
+3. 消息检查当前时间戳 > 应该发送消息的时间戳时，将该消息包装成一条信息到commitlog并转移到consumerqueue供consumer消费。
+
+时间比较的核心逻辑：
+
+```java
+// 比较时间戳，deliverTimestamp延时发送的时间戳，当未到延时发送时间时即countdown > 0，则放入下次调度任务，直接返回
+long now = System.currentTimeMillis();
+long deliverTimestamp = this.correctDeliverTimestamp(now, tagsCode);
+nextOffset = offset + (i / ConsumeQueue.CQ_STORE_UNIT_SIZE);
+long countdown = deliverTimestamp - now;
+if (countdown > 0) {
+  this.scheduleNextTimerTask(nextOffset, DELAY_FOR_A_WHILE);
+  return;
+}
+  
+private long correctDeliverTimestamp(final long now, final long deliverTimestamp) {
+  long result = deliverTimestamp;
+  long maxTimestamp = now + ScheduleMessageService.this.delayLevelTable.get(this.delayLevel);
+  if (deliverTimestamp > maxTimestamp) {
+    result = now;
+  }
+  return result;
+}
+```
+
+> 由上述可知，tagsCode保存的是定时消息需要投递时的时间戳，非我们理解的普通消息的tag hashcode。那么这个tagsCode是什么时候把这个时间设置进去的呢？
+
+1、 tagsCode设置投递时间戳的方法。org.apache.rocketmq.store.CommitLog#checkMessageAndReturnSize(java.nio.ByteBuffer, boolean, boolean)
+
+```java
+// Timing message processing
+{
+    String t = propertiesMap.get(MessageConst.PROPERTY_DELAY_TIME_LEVEL);
+    if (TopicValidator.RMQ_SYS_SCHEDULE_TOPIC.equals(topic) && t != null) {
+        int delayLevel = Integer.parseInt(t);
+
+        if (delayLevel > this.defaultMessageStore.getScheduleMessageService().getMaxDelayLevel()) {
+            delayLevel = this.defaultMessageStore.getScheduleMessageService().getMaxDelayLevel();
+        }
+
+        if (delayLevel > 0) {
+            tagsCode = this.defaultMessageStore.getScheduleMessageService().computeDeliverTimestamp(delayLevel,
+                storeTimestamp);
+        }
+    }
+}
+```
+
+2. checkMessageAndReturnSize被调用的地方共有2处：
+   1. commitlog分发文件时：`org.apache.rocketmq.store.DefaultMessageStore.ReputMessageService#doReput`
+   2. broker启动恢复文件时：`org.apache.rocketmq.store.CommitLog#recoverNormally`
 
 #### 7. 消息过滤
 
