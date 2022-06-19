@@ -244,6 +244,40 @@ public static MessageBatch generateFromList(Collection<Message> messages) {
   message.putUserProperties(PropertyKeyConst.CheckImmunityTimeInSeconds, "60");
   ```
 
+> TransactionListener
+
+- `executeLocalTransaction`
+
+该方法实现具体的业务逻辑，包含记录本地事务状态。主要是设置本地事务状态，该方法与业务方代码在一个事务中，例如在OrderServer#createMap中，只要本地事务提交成功，该方法也会提交成功。故在这里，主要是向
+t_message_transaction添加一条记录，在事务回查时，如果存在记录，就认为是该消息需要提交，其返回值建议返回
+LocalTransactionState.UNKNOW。
+
+- `checkLocalTransaction`
+
+该方法主要告知RocketMQ消息是否需要提交或者回滚，如果本地事务表（t_message_transaction）存在记录，则认为提交；如果不存在，返回事务状态未知。如果在指定次数内还是未查到消息，RocketMQ将自动回滚该消息，默认为15次，可自定义。
+
+```java
+public interface TransactionListener {
+    /**
+     * When send transactional prepare(half) message succeed, this method will be invoked to execute local transaction.
+     *
+     * @param msg Half(prepare) message
+     * @param arg Custom business parameter
+     * @return Transaction state
+     */
+    LocalTransactionState executeLocalTransaction(final Message msg, final Object arg);
+
+    /**
+     * When no response to prepare(half) message. broker will send check message to check the transaction status, and this
+     * method will be invoked to get local transaction status.
+     *
+     * @param msg Check message
+     * @return Transaction state
+     */
+    LocalTransactionState checkLocalTransaction(final MessageExt msg);
+}
+```
+
 ### 延时/定时消息
 
 原生的Apache RocketMQ并不支持任意事件的延时消息和定时消息，Aliyun RocketMQ可支持定时消息。
@@ -4289,7 +4323,7 @@ private void maintainAsCandidate() throws Exception {
               }
               break;
             case REJECT_EXPIRED_LEDGER_TERM: // 拒绝票，自己维护的ledgerEndTerm小于远端维护的ledgerEndTerm
-            case REJECT_SMALL_LEDGER_END_INDEX: // 拒绝票，自己维护ledgerEndTerm == 远端维护ledgerEndTerm && 自己维护dledgerEndIndex  == 远端维护dledgerEndIndex 
+            case REJECT_SMALL_LEDGER_END_INDEX: // 拒绝票，自己维护ledgerEndTerm == 远端维护ledgerEndTerm && 自己维护dledgerEndIndex  < 远端维护dledgerEndIndex 
               // 对方比自己大的节点个数biggerLedgerNum + 1
               biggerLedgerNum.incrementAndGet();
               break;
