@@ -30,7 +30,7 @@ public class TransactionProducer {
             }
         });
         // 设置NameServer的地址
-        producer.setNamesrvAddr("10.0.88.8:9876");
+        producer.setNamesrvAddr("127.0.0.1:9876");
         producer.setExecutorService(executorService);
         producer.setTransactionListener(transactionListener);
         producer.start();
