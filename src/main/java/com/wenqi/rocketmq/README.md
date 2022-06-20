@@ -1198,7 +1198,9 @@ public interface TransactionListener {
 
 ![transaction-事务消息发送.png](../../../../resources/pic/transaction-事务消息发送.png)
 
+- 事务回查机制
 
+![transaction-事务回查机制](../../../../resources/pic/transaction-事务回查机制.png)
 
 
 
@@ -1411,6 +1413,148 @@ public void endTransaction(
     String remark = localException != null ? ("executeLocalTransactionBranch exception: " + localException.toString()) : null;
     // 发送broker处理事务
     this.mQClientFactory.getMQClientAPIImpl().endTransactionOneway(brokerAddr, requestHeader, remark, this.defaultMQProducer.getSendMsgTimeout());
+}
+```
+
+###### checkTransactionState
+
+Broker时会消息回查会调用此方法：`org.apache.rocketmq.client.impl.ClientRemotingProcessor#checkTransactionState`
+
+```java
+// 接收broker请求
+public RemotingCommand processRequest(ChannelHandlerContext ctx, RemotingCommand request) throws RemotingCommandException {
+        switch (request.getCode()) {
+            case RequestCode.CHECK_TRANSACTION_STATE:
+                return this.checkTransactionState(ctx, request);
+            // ....
+    }
+}
+
+public RemotingCommand checkTransactionState(ChannelHandlerContext ctx,
+    RemotingCommand request) throws RemotingCommandException {
+  final CheckTransactionStateRequestHeader requestHeader =
+    (CheckTransactionStateRequestHeader) request.decodeCommandCustomHeader(CheckTransactionStateRequestHeader.class);
+  final ByteBuffer byteBuffer = ByteBuffer.wrap(request.getBody());
+  final MessageExt messageExt = MessageDecoder.decode(byteBuffer);
+  if (messageExt != null) {
+    if (StringUtils.isNotEmpty(this.mqClientFactory.getClientConfig().getNamespace())) {
+      messageExt.setTopic(NamespaceUtil
+                          .withoutNamespace(messageExt.getTopic(), this.mqClientFactory.getClientConfig().getNamespace()));
+    }
+    String transactionId = messageExt.getProperty(MessageConst.PROPERTY_UNIQ_CLIENT_MESSAGE_ID_KEYIDX);
+    if (null != transactionId && !"".equals(transactionId)) {
+      messageExt.setTransactionId(transactionId);
+    }
+    final String group = messageExt.getProperty(MessageConst.PROPERTY_PRODUCER_GROUP);
+    if (group != null) {
+      MQProducerInner producer = this.mqClientFactory.selectProducer(group);
+      if (producer != null) {
+        final String addr = RemotingHelper.parseChannelRemoteAddr(ctx.channel());
+				// 最终调用生产者的checkTransactionState方法
+        producer.checkTransactionState(addr, messageExt, requestHeader);
+      } else {
+        log.debug("checkTransactionState, pick producer by group[{}] failed", group);
+      }
+    } else {
+      log.warn("checkTransactionState, pick producer group failed");
+    }
+  } else {
+    log.warn("checkTransactionState, decode message failed");
+  }
+
+  return null;
+}
+
+// org.apache.rocketmq.client.impl.producer.DefaultMQProducerImpl#checkTransactionState
+// 该方法目的：创建一个Runnable，线程池提交Runnable，异步执行事务检查
+public void checkTransactionState(final String addr, final MessageExt msg, final CheckTransactionStateRequestHeader header) {
+  Runnable request = new Runnable() {
+    private final String brokerAddr = addr;
+    private final MessageExt message = msg;
+    private final CheckTransactionStateRequestHeader checkRequestHeader = header;
+    private final String group = DefaultMQProducerImpl.this.defaultMQProducer.getProducerGroup();
+
+    @Override
+    public void run() {
+      // 获取消息发送者的TransactionListener
+      TransactionCheckListener transactionCheckListener = DefaultMQProducerImpl.this.checkListener();
+      TransactionListener transactionListener = getCheckListener();
+      if (transactionCheckListener != null || transactionListener != null) {
+        LocalTransactionState localTransactionState = LocalTransactionState.UNKNOW;
+        Throwable exception = null;
+        try {
+          if (transactionCheckListener != null) {
+            localTransactionState = transactionCheckListener.checkLocalTransactionState(message);
+          } else if (transactionListener != null) {
+            log.debug("Used new check API in transaction message");
+            // 检测本地事务状态，返回事务状态
+            localTransactionState = transactionListener.checkLocalTransaction(message);
+          } else {
+            log.warn("CheckTransactionState, pick transactionListener by group[{}] failed", group);
+          }
+        } catch (Throwable e) {
+          log.error("Broker call checkTransactionState, but checkLocalTransactionState exception", e);
+          exception = e;
+        }
+			 // 向broker提交事务状态
+        this.processTransactionState(
+          localTransactionState,
+          group,
+          exception);
+      } else {
+        log.warn("CheckTransactionState, pick transactionCheckListener by group[{}] failed", group);
+      }
+    }
+
+    private void processTransactionState(
+      final LocalTransactionState localTransactionState,
+      final String producerGroup,
+      final Throwable exception) {
+      final EndTransactionRequestHeader thisHeader = new EndTransactionRequestHeader();
+      thisHeader.setCommitLogOffset(checkRequestHeader.getCommitLogOffset());
+      thisHeader.setProducerGroup(producerGroup);
+      thisHeader.setTranStateTableOffset(checkRequestHeader.getTranStateTableOffset());
+      thisHeader.setFromTransactionCheck(true);
+
+      String uniqueKey = message.getProperties().get(MessageConst.PROPERTY_UNIQ_CLIENT_MESSAGE_ID_KEYIDX);
+      if (uniqueKey == null) {
+        uniqueKey = message.getMsgId();
+      }
+      thisHeader.setMsgId(uniqueKey);
+      thisHeader.setTransactionId(checkRequestHeader.getTransactionId());
+      switch (localTransactionState) {
+        case COMMIT_MESSAGE:
+          thisHeader.setCommitOrRollback(MessageSysFlag.TRANSACTION_COMMIT_TYPE);
+          break;
+        case ROLLBACK_MESSAGE:
+          thisHeader.setCommitOrRollback(MessageSysFlag.TRANSACTION_ROLLBACK_TYPE);
+          log.warn("when broker check, client rollback this transaction, {}", thisHeader);
+          break;
+        case UNKNOW:
+          thisHeader.setCommitOrRollback(MessageSysFlag.TRANSACTION_NOT_TYPE);
+          log.warn("when broker check, client does not know this transaction state, {}", thisHeader);
+          break;
+        default:
+          break;
+      }
+
+      String remark = null;
+      if (exception != null) {
+        remark = "checkLocalTransactionState Exception: " + RemotingHelper.exceptionSimpleDesc(exception);
+      }
+      doExecuteEndTransactionHook(msg, uniqueKey, brokerAddr, localTransactionState, true);
+
+      try {
+        // 然后向Broker发送RequestCode.END_TRANSACTION命令即可，处理事务状态
+        DefaultMQProducerImpl.this.mQClientFactory.getMQClientAPIImpl().endTransactionOneway(brokerAddr, thisHeader, remark,
+                                                                                             3000);
+      } catch (Exception e) {
+        log.error("endTransactionOneway exception", e);
+      }
+    }
+  };
+
+  this.checkExecutor.submit(request);
 }
 ```
 
@@ -1683,7 +1827,7 @@ public void check(long transactionTimeout, int transactionCheckMax, AbstractTran
                     break;
                 }
                 // 如果removeMap中包含当前处理的消息，则继续下一条
-                // emoveMap中的值是通过fillOpRemoveMap中填充的, 具体实现逻辑是: 
+                // removeMap中的值是通过fillOpRemoveMap中填充的, 具体实现逻辑是: 
                 // 1. 从RMQ_SYS_TRANS_OP_HALF_TOPIC主题中拉取32条
                 // 2. 如果拉取的消息队列偏移量大于等于RMQ_SYS_TRANS_HALF_TOPIC#queueId当前的处理进度时，会添加到removeMap中，表示已处理过。
                 if (removeMap.containsKey(i)) {
@@ -1768,25 +1912,35 @@ public void check(long transactionTimeout, int transactionCheckMax, AbstractTran
                         || (opMsg != null && (opMsg.get(opMsg.size() - 1).getBornTimestamp() - startTime > transactionTimeout))
                         || (valueOfCurrentMinusBorn <= -1);
 
-                    if (isNeedCheck) {
-                        if (!putBackHalfMsgQueue(msgExt, i)) {
-                            continue;
-                        }
-                        listener.resolveHalfMsg(msgExt);
-                    } else {
-                        pullResult = fillOpRemoveMap(removeMap, opQueue, pullResult.getNextBeginOffset(), halfOffset, doneOpOffset);
-                        log.debug("The miss offset:{} in messageQueue:{} need to get more opMsg, result is:{}", i,
-                            messageQueue, pullResult);
-                        continue;
+                  
+                  // 如果需要发送事务状态回查消息，则先将消息再次存储到RMQ_SYS_TRANS_HALF_TOPIC主题中，存储成功则返回true，否则返回false
+                  // 如果发送成功，会将该消息的queueOffset、commitLogOffset设置为重新存入的偏移量  
+                  if (isNeedCheck) {
+                    if (!putBackHalfMsgQueue(msgExt, i)) {
+                      continue;
                     }
+                    // 事务回查
+                    listener.resolveHalfMsg(msgExt);
+                  } else {
+                    // 如果无法判断是否发送回查消息，则加载更多的已处理消息进行刷选
+                    pullResult = fillOpRemoveMap(removeMap, opQueue, pullResult.getNextBeginOffset(), halfOffset, doneOpOffset);
+                    log.debug("The miss offset:{} in messageQueue:{} need to get more opMsg, result is:{}", i,
+                              messageQueue, pullResult);
+                    continue;
+                  }
+                  
+                  //=============================== 分割线 ===============================//
+
                 }
                 newOffset = i + 1;
                 i++;
             }
+          	// 保存(Prepare)消息队列的回查进度
             if (newOffset != halfOffset) {
                 transactionalMessageBridge.updateConsumeOffset(messageQueue, newOffset);
             }
             long newOpOffset = calculateOpOffset(doneOpOffset, opOffset);
+          	// 保存处理队列（op）的进度
             if (newOpOffset != opOffset) {
                 transactionalMessageBridge.updateConsumeOffset(opQueue, newOpOffset);
             }
@@ -1811,6 +1965,61 @@ public void check(long transactionTimeout, int transactionCheckMax, AbstractTran
 > transactionTimeout
 
 事务消息的超时时间，其设计的意义是，应用程序在发送事务消息后，事务不会马上提交，该时间就是假设事务消息发送成功后，应用程序事务提交的时间，在这段时间内，RocketMQ任务事务未提交，故不应该在这个时间段向应用程序发送回查请求。
+
+###### resolveHalfMsg
+
+`org.apache.rocketmq.broker.transaction.AbstractTransactionalMessageCheckListener#resolveHalfMsg`
+
+`TransactionalMessageCheckService`半消息检查线程在需要事务回查时会调用`resolveHalfMsg()`方法，发起具体的事务回查。
+
+这里用一个线程池来异步发送回查消息，为了回查进度保存的简化，这里只要发送了回查消息，当前回查进度会向前推动，如果回查失败，上一步骤新增的消息将可以再次发送回查消息，那如果回查消息发送成功，那会不会下一次又重复发送回查消息呢？这个可以根据OP队列中的消息来判断是否重复，如果回查消息发送成功并且消息服务器完成提交或回滚操作，这条消息会发送到OP队列中，然后fillOpRemoveMap根据处理进度获取一批已处理的消息，来与消息判断是否重复，由于fillopRemoveMap一次只拉32条消息，那又如何保证一定能拉取到与当前消息的处理记录呢？其实就是通过代码@10来实现的，如果此批消息最后一条未超过事务延迟消息，则继续拉取更多消息进行判断（@12）和(@14),op队列也会随着回查进度的推进而推进。
+
+```java
+public void resolveHalfMsg(final MessageExt msgExt) {
+    executorService.execute(new Runnable() {
+        @Override
+        public void run() {
+            try {
+                sendCheckMessage(msgExt);
+            } catch (Exception e) {
+                LOGGER.error("Send check message error!", e);
+            }
+        }
+    });
+}
+```
+
+###### sendCheckMessage
+
+构建回查事务状态请求消息，执行事务消息回查，`org.apache.rocketmq.broker.transaction.AbstractTransactionalMessageCheckListener#sendCheckMessage`
+
+```java
+public void sendCheckMessage(MessageExt msgExt) throws Exception {
+  CheckTransactionStateRequestHeader checkTransactionStateRequestHeader = new CheckTransactionStateRequestHeader();
+	// 消息offsetId
+  checkTransactionStateRequestHeader.setCommitLogOffset(msgExt.getCommitLogOffset());
+  // 消息ID(索引)
+  checkTransactionStateRequestHeader.setOffsetMsgId(msgExt.getMsgId());
+  // 消息事务ID
+  checkTransactionStateRequestHeader.setMsgId(msgExt.getUserProperty(MessageConst.PROPERTY_UNIQ_CLIENT_MESSAGE_ID_KEYIDX));
+  checkTransactionStateRequestHeader.setTransactionId(checkTransactionStateRequestHeader.getMsgId());
+  // 事务消息队列中的偏移量（RMQ_SYS_TRANS_HALF_TOPIC）
+  checkTransactionStateRequestHeader.setTranStateTableOffset(msgExt.getQueueOffset());
+  // 恢复原消息的主题、队列，并设置storeSize为0
+  msgExt.setTopic(msgExt.getUserProperty(MessageConst.PROPERTY_REAL_TOPIC));
+  msgExt.setQueueId(Integer.parseInt(msgExt.getUserProperty(MessageConst.PROPERTY_REAL_QUEUE_ID)));
+  msgExt.setStoreSize(0);
+  // 获取生产者组名称
+  String groupId = msgExt.getProperty(MessageConst.PROPERTY_PRODUCER_GROUP);
+  // 根据生产者组获取任意一个生产者，通过与其连接发送事务回查消息，回查消息的请求者为【Broker服务器】，接收者为(client，具体为消息生产者)
+  Channel channel = brokerController.getProducerManager().getAvailableChannel(groupId);
+  if (channel != null) {
+    brokerController.getBroker2Client().checkProducerTransactionState(groupId, channel, checkTransactionStateRequestHeader, msgExt);
+  } else {
+    LOGGER.warn("Check transaction failed, channel is null. groupId={}", groupId);
+  }
+}
+```
 
 ## Message
 
