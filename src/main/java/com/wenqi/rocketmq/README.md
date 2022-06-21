@@ -1202,10 +1202,6 @@ public interface TransactionListener {
 
 ![transaction-事务回查机制](../../../../resources/pic/transaction-事务回查机制.png)
 
-
-
-
-
 ##### Producer
 
 > 事务消息发送入口
@@ -1715,18 +1711,30 @@ public RemotingCommand processRequest(ChannelHandlerContext ctx, RemotingCommand
     OperationResult result = new OperationResult();
     // 提交事务
     if (MessageSysFlag.TRANSACTION_COMMIT_TYPE == requestHeader.getCommitOrRollback()) {
+        // 提交消息，别被这名字误导了，该方法主要是根据commitLogOffset从commitlog文件中查找消息返回OperationResult实例
         result = this.brokerController.getTransactionalMessageService().commitMessage(requestHeader);
+        // 如果成功查找到消息，则继续处理，否则返回给客户端，消息未找到错误信息(SYSTEM_ERROR)
         if (result.getResponseCode() == ResponseCode.SUCCESS) {
+            // 验证消息必要字段, 验证通过: SUCCESS, 验证不通过: SYSTEM_ERROR, 主要验证项:
+            // 1. 验证消息的生产组与请求信息中的生产者组是否一致
+            // 2. 验证消息的队列偏移量（queueOffset）与请求信息中的偏移量是否一致
+            // 3. 验证消息的commitLogOffset与请求信息中的CommitLogOffset是否一致
             RemotingCommand res = checkPrepareMessage(result.getPrepareMessage(), requestHeader);
             if (res.getCode() == ResponseCode.SUCCESS) {
+                // 恢复事务消息的真实的主题、队列，并设置事务ID
                 MessageExtBrokerInner msgInner = endMessageTransaction(result.getPrepareMessage());
+                // 设置消息的相关属性, 取消了事务相关的系统标记
                 msgInner.setSysFlag(MessageSysFlag.resetTransactionValue(msgInner.getSysFlag(), requestHeader.getCommitOrRollback()));
                 msgInner.setQueueOffset(requestHeader.getTranStateTableOffset());
                 msgInner.setPreparedTransactionOffset(requestHeader.getCommitLogOffset());
                 msgInner.setStoreTimestamp(result.getPrepareMessage().getStoreTimestamp());
                 MessageAccessor.clearProperty(msgInner, MessageConst.PROPERTY_TRANSACTION_PREPARED);
+                // 发送最终消息，其实现原理非常简单，调用MessageStore将消息存储在commitlog文件中，此时的消息，会被转发到原消息主题对应的消费队列，被消费者消费
                 RemotingCommand sendResult = sendFinalMessage(msgInner);
                 if (sendResult.getCode() == ResponseCode.SUCCESS) {
+                    // 删除预处理消息(prepare)
+                    // 其实是将消息存储在主题为：RMQ_SYS_TRANS_OP_HALF_TOPIC的主题中, 设置消息属性为TransactionalMessageUtil.REMOVETAG
+                    // 代表这些消息已经被处理（提交或回滚）
                     this.brokerController.getTransactionalMessageService().deletePrepareMessage(result.getPrepareMessage());
                 }
                 return sendResult;
@@ -1735,10 +1743,15 @@ public RemotingCommand processRequest(ChannelHandlerContext ctx, RemotingCommand
         }
     // 回滚事务
     } else if (MessageSysFlag.TRANSACTION_ROLLBACK_TYPE == requestHeader.getCommitOrRollback()) {
+        // 回滚消息，其实内部就是根据commitlogOffset查找消
         result = this.brokerController.getTransactionalMessageService().rollbackMessage(requestHeader);
         if (result.getResponseCode() == ResponseCode.SUCCESS) {
             RemotingCommand res = checkPrepareMessage(result.getPrepareMessage(), requestHeader);
             if (res.getCode() == ResponseCode.SUCCESS) {
+                // 删除预处理消息(prepare)
+                // 将消息存储在RMQ_SYS_TRANS_OP_HALF_TOPIC中，代表该消息已被处理, 设置消息属性为TransactionalMessageUtil.REMOVETAG
+                // 代表这些消息已经被处理（提交或回滚）
+                // 对比提交事务消息：提交事务消息会队列一步，将消息恢复原主题与队列，再次存储在commitlog文件中供consumer消费
                 this.brokerController.getTransactionalMessageService().deletePrepareMessage(result.getPrepareMessage());
             }
             return res;
@@ -1922,7 +1935,7 @@ public void check(long transactionTimeout, int transactionCheckMax, AbstractTran
                     // 事务回查
                     listener.resolveHalfMsg(msgExt);
                   } else {
-                    // 如果无法判断是否发送回查消息，则加载更多的已处理消息进行刷选
+                    // 如果无法判断是否发送回查消息，则加载更多的已处理消息进行刷选, fillOpRemoveMap会拉取32条opMessage
                     pullResult = fillOpRemoveMap(removeMap, opQueue, pullResult.getNextBeginOffset(), halfOffset, doneOpOffset);
                     log.debug("The miss offset:{} in messageQueue:{} need to get more opMsg, result is:{}", i,
                               messageQueue, pullResult);
