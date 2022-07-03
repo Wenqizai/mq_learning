@@ -2343,6 +2343,8 @@ if (!registerOK) {
 
 #### 2. 消息拉取
 
+拉取offset关系：https://segmentfault.com/a/1190000041764749
+
 `MQClientInstance#start`启动过程中，会使用一个单独的线程`pullMessageService`进行消息的拉取。
 
 ```java
@@ -7771,6 +7773,9 @@ TreeMap<Long /*偏移量*/, MessageExt /*消息*/> msgTreeMap = new TreeMap<Long
 ```
 
 2. 消费进度未提交，客户端或者Broker宕机了。
+2. 消费消息重试机制（最多16次）
+2. Producer发送消息重复了，如Producer在等待Broker应答时，Broker宕机了，Producer超时重复发送消息。
+2. 消费的负载均衡重复了，当消息队列 RocketMQ 的 Broker或客户端重启、扩容或缩容时，会触发Rebalance重平衡机制，此时消费者可能会收到重复消息。
 
 ### 疑问点，待解决
 
